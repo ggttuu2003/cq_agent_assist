@@ -1,0 +1,18 @@
+# 当前第一步使用的基础依赖
+# Python 3.11 及以上版本
+
+# Web API 服务
+fastapi>=0.115,<1.0
+uvicorn[standard]>=0.34,<1.0
+
+# 配置与数据校验
+pydantic>=2.10,<3.0
+pydantic-settings>=2.7,<3.0
+python-dotenv>=1.0,<2.0
+
+# MySQL 异步访问
+sqlalchemy[asyncio]>=2.0,<3.0
+aiomysql>=0.2,<1.0
+
+# Milvus 向量库客户端
+pymilvus>=3.0,<4.0
