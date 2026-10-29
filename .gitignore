@@ -23,3 +23,8 @@ data/
 dist/
 build/
 *.egg-info/
+
+# 前端依赖和本地构建缓存。
+node_modules/
+.vite/
+*.tsbuildinfo

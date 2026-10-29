@@ -10,6 +10,15 @@ pydantic>=2.10,<3.0
 pydantic-settings>=2.7,<3.0
 python-dotenv>=1.0,<2.0
 
+# 异步调用模型服务
+httpx>=0.28,<1.0
+
+# Agent 图编排与模型客户端
+langgraph>=1.0,<2.0
+langchain-core>=1.0,<2.0
+langchain-openai>=1.7.3,<2.0
+openai>=2.45,<4.0
+
 # MySQL 异步访问
 sqlalchemy[asyncio]>=2.0,<3.0
 aiomysql>=0.2,<1.0
