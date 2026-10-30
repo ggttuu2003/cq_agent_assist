@@ -15,6 +15,7 @@ from langgraph.prebuilt import ToolNode, tools_condition
 from openai import APIConnectionError, APIResponseValidationError, APIStatusError, APITimeoutError
 
 from app.llm.errors import ModelError
+from app.llm.factory import image_input_support
 
 logger = logging.getLogger(__name__)
 
@@ -71,10 +72,17 @@ class ModelNode:
         tool_rounds = sum(bool(getattr(message, "tool_calls", None)) for message in state["messages"])
         final_answer = tool_rounds >= 3
         model = self.final_model if final_answer else self.model
+        image_count = sum(
+            1 for message in state["messages"] if isinstance(message.content, list)
+            for block in message.content if isinstance(block, dict) and block.get("type") == "image_url"
+        )
+        # 模型节点也校验，防止绕过会话接口直接调用图时，图片被纯文字模型静默忽略。
+        if image_count and image_input_support(self.model_name) is False:
+            raise ModelError(f"模型 {self.model_name} 仅支持文字，请使用视觉模型处理图片")
         started = perf_counter()
         outcome = "失败"
-        logger.info("模型调用开始 模型=%s 消息数=%s 已用工具轮数=%s", self.model_name,
-                    len(state["messages"]), tool_rounds)
+        logger.info("模型调用开始 模型=%s 消息数=%s 图片数=%s 已用工具轮数=%s", self.model_name,
+                    len(state["messages"]), image_count, tool_rounds)
         try:
             # ainvoke 是异步调用方法；await 等待模型回答，同时允许处理其他请求。
             response = await model.ainvoke([self.instructions(final_answer), *state["messages"]])
@@ -84,6 +92,8 @@ class ModelNode:
             raise ModelError("模型响应超时，请稍后重试") from None
         except APIStatusError as exc:
             logger.warning("模型服务请求失败 模型=%s status=%s", self.model_name, exc.status_code)
+            if exc.status_code == 400 and image_count:
+                raise ModelError("图片请求被模型服务拒绝，请确认本会话模型支持图片，并检查图片大小；可在输入框旁切换到视觉模型") from None
             raise ModelError(
                 f"模型服务返回 HTTP {exc.status_code}，请检查模型配置或额度"
             ) from None

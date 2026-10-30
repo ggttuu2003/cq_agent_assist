@@ -7,11 +7,22 @@ from langgraph.graph.state import CompiledStateGraph
 
 from app.dependencies import get_agent
 from app.llm.errors import ModelError
-from app.schemas.chat import ChatModelInfo, ChatRequest, ChatResponse
+from app.llm.factory import available_models, image_input_support
+from app.schemas.chat import ChatModelCatalog, ChatModelInfo, ChatModelOption, ChatRequest, ChatResponse
 
 
 # 收集本模块的接口，最后由 main.py 注册到 FastAPI 应用。
 router = APIRouter()
+
+
+@router.get("/models", response_model=ChatModelCatalog)
+async def list_models(request: Request) -> ChatModelCatalog:
+    """返回配置中允许选择的模型，仅读取本地配置。"""
+    settings = request.app.state.settings
+    return ChatModelCatalog(default_model=settings.llm_model.strip(), models=[
+        ChatModelOption(model=name, image_input_supported=image_input_support(name))
+        for name in available_models(settings)
+    ])
 
 
 @router.get("/models/default", response_model=ChatModelInfo)

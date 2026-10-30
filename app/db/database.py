@@ -23,6 +23,14 @@ async def initialize_database(engine, default_model: str = "") -> None:
     """创建缺失的表，并为旧会话补上模型字段。"""
     async with engine.begin() as connection:
         await connection.run_sync(Base.metadata.create_all)
+        attachment_columns = await connection.run_sync(
+            lambda sync_connection: [column["name"] for column in inspect(sync_connection)
+                                     .get_columns("cq_message_attachment")]
+        )
+        if "position" not in attachment_columns:
+            await connection.execute(text(
+                "ALTER TABLE cq_message_attachment ADD COLUMN position INT NOT NULL DEFAULT 0 COMMENT '消息内的附件顺序'"
+            ))
         columns = await connection.run_sync(
             lambda sync_connection: [column["name"] for column in inspect(
                 sync_connection,

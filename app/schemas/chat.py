@@ -28,3 +28,15 @@ class ChatModelInfo(BaseModel):
     """新会话的默认模型信息。"""
 
     model: str
+
+
+class ChatModelOption(BaseModel):
+    """可选模型及已知的图片输入能力。"""
+    model: str
+    image_input_supported: bool | None = None
+
+
+class ChatModelCatalog(BaseModel):
+    """页面模型选择器所需的数据，不包含服务地址和密钥。"""
+    default_model: str
+    models: list[ChatModelOption]

@@ -14,9 +14,11 @@ import {
   ArrowUp,
   ArrowUpRight,
   Check,
+  ChevronDown,
   Copy,
   Cpu,
   Globe,
+  ImagePlus,
   Pencil,
   MessageSquare,
   UserRound,
@@ -31,7 +33,7 @@ import {
   Trash2,
   X,
 } from 'lucide-react';
-import { createConversation, getConversation, getDefaultModel, listConversations, removeConversation, renameConversation, streamMessage, type Conversation, type ConversationTurn, type Message, type User } from './api';
+import { attachmentUrl, createConversation, getConversation, getModels, listConversations, removeConversation, renameConversation, streamMessage, switchConversationModel, uploadImage, type Attachment, type Conversation, type ConversationTurn, type Message, type ModelOption, type User } from './api';
 
 // Markdown 和代码高亮体积较大，首次出现回答时再加载，欢迎页可以更快显示。
 const Markdown = lazy(() => import('./Markdown'));
@@ -40,6 +42,10 @@ const SIDEBAR_WIDTH_KEY = 'cq-assist.sidebar-width';
 const SIDEBAR_MIN_WIDTH = 220;
 const SIDEBAR_DEFAULT_WIDTH = 256;
 const SIDEBAR_MAX_WIDTH = 400;
+
+/** 草稿缩略图仅在当前页面使用；发送时传递已上传的附件编号。 */
+type DraftImage = { id: string; name: string; size: number; preview: string;
+  status: 'uploading' | 'ready' | 'error'; attachment?: Attachment; error?: string };
 
 /** 地址只记录正在查看的会话编号，正文和模型仍从服务端读取。 */
 function loadActiveConversation(): string | null {
@@ -107,8 +113,15 @@ export default function ChatWorkspace({ user, profileLoading, profileError, conn
   const [renaming, setRenaming] = useState<{ id: string; title: string; error: string } | null>(null);
   const [savingTitle, setSavingTitle] = useState(false);
   const [draft, setDraft] = useState('');
+  const [draftImages, setDraftImages] = useState<DraftImage[]>([]);
+  const [uploadingImages, setUploadingImages] = useState(false);
   const [defaultModelName, setDefaultModelName] = useState<string | null>(null);
   const [defaultModelError, setDefaultModelError] = useState(false);
+  const [modelOptions, setModelOptions] = useState<ModelOption[]>([]);
+  const [draftModelName, setDraftModelName] = useState('');
+  const [savingModel, setSavingModel] = useState(false);
+  // 同步标记先于 React 渲染生效，防止切换请求未完成时紧接着发送消息。
+  const modelSwitchRef = useRef(false);
   const [sidebarOpen, setSidebarOpen] = useState(() => window.innerWidth > 760);
   const [sidebarWidth, setSidebarWidth] = useState(loadSidebarWidth);
   const [viewportWidth, setViewportWidth] = useState(() => window.innerWidth);
@@ -124,6 +137,9 @@ export default function ChatWorkspace({ user, profileLoading, profileError, conn
   const [toast, setToast] = useState('');
   const [showScrollButton, setShowScrollButton] = useState(false);
   const inputRef = useRef<HTMLTextAreaElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const uploadRef = useRef<AbortController | null>(null);
+  const previewUrlsRef = useRef(new Set<string>());
   const scrollRef = useRef<HTMLDivElement>(null);
   const searchRef = useRef<HTMLInputElement>(null);
   const searchTriggerRef = useRef<HTMLButtonElement>(null);
@@ -144,10 +160,11 @@ export default function ChatWorkspace({ user, profileLoading, profileError, conn
   const messages = active?.messages ?? [];
   const restoringConversation = !!activeId && !active;
   const isWelcome = messages.length === 0 && !restoringConversation;
-  // 打开会话时以该会话为准，默认模型接口失败也不影响已有会话的显示。
-  const displayedModel = active
-    ? active.modelName || '未配置模型'
-    : defaultModelError ? '模型信息不可用' : defaultModelName ?? '读取模型…';
+  // 已有会话使用服务端保存的选择，新对话先在草稿中选择，发送时一起创建。
+  const selectedModel = active?.modelName ?? (draftModelName || defaultModelName || '');
+  const displayedModel = selectedModel || (defaultModelError ? '模型列表不可用' : '读取模型…');
+  const supportsImages = active?.imageInputSupported ??
+    modelOptions.find((item) => item.model === selectedModel)?.image_input_supported;
   const isActivePending = pending?.conversationId === activeId;
   const filteredConversations = [...conversations]
     .sort((first, second) => second.updatedAt - first.updatedAt)
@@ -169,15 +186,16 @@ export default function ChatWorkspace({ user, profileLoading, profileError, conn
   }, [activeId]);
 
   useEffect(() => {
-    // 默认模型独立于个人资料，只在首次进入和手动重连时读取。
+    // 模型列表独立于个人资料，只在首次进入和手动重连时读取。
     // 不再依赖 user.id，避免资料加载成功后重复发送同一请求。
     const controller = new AbortController();
     // 延后启动，让 StrictMode 的即时清理可以在发送网络请求前撤销本次任务。
     const timer = window.setTimeout(() => {
-      getDefaultModel(controller.signal)
-        .then((name) => {
+      getModels(controller.signal)
+        .then((catalog) => {
           if (!controller.signal.aborted) {
-            setDefaultModelName(name || '未配置模型');
+            setDefaultModelName(catalog.default_model);
+            setModelOptions(catalog.models);
             setDefaultModelError(false);
           }
         })
@@ -331,6 +349,11 @@ export default function ChatWorkspace({ user, profileLoading, profileError, conn
   }, [toast]);
 
   useEffect(() => () => requestRef.current?.abort(), []);
+  useEffect(() => () => {
+    uploadRef.current?.abort();
+    previewUrlsRef.current.forEach((url) => URL.revokeObjectURL(url));
+    previewUrlsRef.current.clear();
+  }, []);
 
   /** 捕获指针，鼠标离开细小拖动条后仍可继续调整侧栏。 */
   function startSidebarResize(event: PointerEvent<HTMLDivElement>) {
@@ -437,7 +460,7 @@ export default function ChatWorkspace({ user, profileLoading, profileError, conn
   }
 
   /** 逐段追加到本次回答，完成事件到达后替换为已保存消息。 */
-  async function requestAnswer(conversationId: string, messageId: string, question: string) {
+  async function requestAnswer(conversationId: string, messageId: string, question: string, attachments: Attachment[] = []) {
     const controller = new AbortController();
     requestRef.current = controller;
     setPending({ conversationId, messageId });
@@ -462,7 +485,7 @@ export default function ChatWorkspace({ user, profileLoading, profileError, conn
               : [...calls, event.call] };
           }),
         } : item));
-      });
+      }, attachments);
       if (!controller.signal.aborted) applyTurn(turn, messageId);
     } catch (error) {
       const cancelled = controller.signal.aborted;
@@ -491,20 +514,82 @@ export default function ChatWorkspace({ user, profileLoading, profileError, conn
     requestRef.current.abort();
   }
 
+  /** 切换会话时取消草稿上传并释放缩略图地址，已发送的图片由后端地址展示。 */
+  function clearDraftImages() {
+    uploadRef.current?.abort();
+    uploadRef.current = null;
+    previewUrlsRef.current.forEach((url) => URL.revokeObjectURL(url));
+    previewUrlsRef.current.clear();
+    setDraftImages([]);
+    setUploadingImages(false);
+  }
+
+  /** 同一批图片并行上传；旧批次取消后，不能把结果写进新的会话草稿。 */
+  async function addImages(files: File[]) {
+    if (!files.length || uploadRef.current || modelSwitchRef.current || creating || pending || active?.generating || !user) return;
+    if (supportsImages === false) {
+      setToast(`模型 ${selectedModel} 仅支持文字，请切换到视觉模型后再发图`);
+      return;
+    }
+    if (files.length + draftImages.length > 4) { setToast('每轮最多添加 4 张图片'); return; }
+    if (files.some((file) => file.size > 5 * 1024 * 1024)) { setToast('单张图片不能超过 5 MB'); return; }
+    if (files.reduce((size, file) => size + file.size, 0) + draftImages.reduce((size, file) => size + file.size, 0) > 10 * 1024 * 1024) {
+      setToast('每轮图片总大小不能超过 10 MB'); return;
+    }
+    const controller = new AbortController();
+    uploadRef.current = controller;
+    const additions: DraftImage[] = files.map((file) => {
+      const preview = URL.createObjectURL(file);
+      previewUrlsRef.current.add(preview);
+      return { id: createId(), name: file.name || '截图', size: file.size, preview, status: 'uploading' };
+    });
+    setDraftImages((previous) => [...previous, ...additions]);
+    setUploadingImages(true);
+    try {
+      await Promise.all(files.map(async (file, index) => {
+        try {
+          const attachment = await uploadImage(file, controller.signal);
+          if (controller.signal.aborted) return;
+          setDraftImages((previous) => previous.map((item) => item.id === additions[index].id
+            ? { ...item, status: 'ready', attachment } : item));
+        } catch (error) {
+          if (controller.signal.aborted) return;
+          const message = error instanceof Error ? error.message : '图片上传失败，请重新选择';
+          setDraftImages((previous) => previous.map((item) => item.id === additions[index].id
+            ? { ...item, status: 'error', error: message } : item));
+          setToast(message);
+        }
+      }));
+    } finally {
+      if (uploadRef.current === controller) {
+        uploadRef.current = null;
+        setUploadingImages(false);
+      }
+    }
+  }
+
+  /** 移除只改变草稿，后端已上传的独立附件仍可被已发送消息使用。 */
+  function removeDraftImage(id: string) {
+    const image = draftImages.find((item) => item.id === id);
+    if (image) { URL.revokeObjectURL(image.preview); previewUrlsRef.current.delete(image.preview); }
+    setDraftImages((previous) => previous.filter((item) => item.id !== id));
+  }
+
   /** 第一次发送时创建服务端会话，创建失败时保留输入内容。 */
   async function submitMessage(event: FormEvent) {
     event.preventDefault();
-    const question = draft.trim();
-    if (!question || !user || pending || requestRef.current || historyLoading || historyError || restoringConversation || active?.generating || (activeId && renaming?.id === activeId)) return;
+    const attachments = draftImages.flatMap((item) => item.attachment ? [item.attachment] : []);
+    const question = draft.trim() || (attachments.length ? '请描述这些图片' : '');
+    if (!question || modelSwitchRef.current || uploadingImages || uploadRef.current || draftImages.some((item) => item.status !== 'ready') || !user || pending || requestRef.current || historyLoading || historyError || restoringConversation || active?.generating || (activeId && renaming?.id === activeId)) return;
     const controller = new AbortController();
     requestRef.current = controller;
     setCreating(true);
     try {
-      const conversation = active ?? await createConversation(question);
+      const conversation = active ?? await createConversation(question, selectedModel);
       if (controller.signal.aborted) return;
       const answerId = createId();
       const additions: Message[] = [
-        { id: createId(), role: 'user', content: question },
+        { id: createId(), role: 'user', content: question, attachments },
         { id: answerId, role: 'assistant', content: '', status: 'pending' },
       ];
       const updated = { ...conversation,
@@ -513,8 +598,9 @@ export default function ChatWorkspace({ user, profileLoading, profileError, conn
       shouldFollowRef.current = true;
       setActiveId(conversation.id);
       setDraft('');
+      clearDraftImages();
       inputRef.current?.focus();
-      void requestAnswer(conversation.id, answerId, question);
+      void requestAnswer(conversation.id, answerId, question, attachments);
     } catch (error) {
       setToast(error instanceof Error ? error.message : '无法创建会话，请重试。');
     } finally {
@@ -533,14 +619,42 @@ export default function ChatWorkspace({ user, profileLoading, profileError, conn
       event.keyCode !== 229
     ) {
       event.preventDefault();
-      if (draft.trim() && !pending) event.currentTarget.form?.requestSubmit();
+      if ((draft.trim() || draftImages.length) && !pending) event.currentTarget.form?.requestSubmit();
+    }
+  }
+
+  /** 新对话先选草稿模型；已有会话保存成功后才更新页面，不丢失输入和历史。 */
+  async function changeModel(modelName: string) {
+    if (modelName === selectedModel || modelSwitchRef.current || requestRef.current || pending ||
+        creating || restoringConversation || active?.generating) return;
+    const option = modelOptions.find((item) => item.model === modelName);
+    if (!option) return;
+    if (draftImages.length && option.image_input_supported === false) {
+      setToast('草稿中有图片，请先移除图片再切换到文字模型');
+      return;
+    }
+    if (!active) { setDraftModelName(modelName); return; }
+    modelSwitchRef.current = true;
+    setSavingModel(true);
+    try {
+      const saved = await switchConversationModel(active.id, modelName);
+      // 请求期间用户可能打开其他会话，只修改返回编号对应的模型字段。
+      setConversations((items) => items.map((item) => item.id === saved.id
+        ? { ...item, modelName: saved.model_name, imageInputSupported: saved.image_input_supported } : item));
+    } catch (error) {
+      setToast(error instanceof Error ? error.message : '切换失败，请重试');
+    } finally {
+      modelSwitchRef.current = false;
+      setSavingModel(false);
     }
   }
 
   /** 新建空白页面，直到发送第一条消息时才保存会话。 */
   function newConversation() {
     setActiveId(null);
+    setDraftModelName('');
     setDraft('');
+    clearDraftImages();
     if (window.innerWidth <= 760) setSidebarOpen(false);
     window.requestAnimationFrame(() => inputRef.current?.focus());
   }
@@ -549,6 +663,7 @@ export default function ChatWorkspace({ user, profileLoading, profileError, conn
   async function openConversation(id: string) {
     setActiveId(id);
     setDraft('');
+    clearDraftImages();
     setSearchOpen(false);
     setSearch('');
     if (window.innerWidth <= 760) setSidebarOpen(false);
@@ -616,13 +731,17 @@ export default function ChatWorkspace({ user, profileLoading, profileError, conn
 
   /** 使用该回答前面的用户问题重试，替换原回答而不重复追加消息。 */
   function retryMessage(messageId: string) {
-    if (!active || pending || requestRef.current || active.generating) return;
+    if (!active || pending || requestRef.current || modelSwitchRef.current || active.generating) return;
     const index = active.messages.findIndex((message) => message.id === messageId);
     const question = active.messages[index - 1];
     if (index < 1 || question?.role !== 'user') return;
+    if (question.attachments?.length && supportsImages === false) {
+      setToast('这条消息包含图片，请先切换到视觉模型再重试');
+      return;
+    }
     updateAnswer(active.id, messageId, '', 'pending');
     shouldFollowRef.current = true;
-    void requestAnswer(active.id, messageId, question.content);
+    void requestAnswer(active.id, messageId, question.content, question.attachments ?? []);
   }
 
   /** 用户手动回到最新消息后，继续跟随新回答滚动。 */
@@ -645,6 +764,18 @@ export default function ChatWorkspace({ user, profileLoading, profileError, conn
         </button>
       )}
       <form className="composer" onSubmit={submitMessage}>
+        {!!draftImages.length && <div className="draft-images" aria-label="待发送图片">
+          {draftImages.map((image) => <div key={image.id} className={`draft-image image-${image.status}`}>
+            <img src={image.preview} alt={image.name} />
+            <button type="button" className="remove-image" onClick={() => removeDraftImage(image.id)}
+              disabled={creating} aria-label={`移除图片 ${image.name}`} title="移除图片"><X size={12} /></button>
+            {image.status === 'uploading' && <span className="image-overlay" aria-label="图片上传中"><span className="small-spinner" /></span>}
+            {image.status === 'error' && <span className="image-error" title={image.error}>上传失败</span>}
+          </div>)}
+        </div>}
+        <input type="file" ref={fileInputRef} className="sr-only" tabIndex={-1} multiple
+          accept="image/jpeg,image/png,image/webp" aria-label="选择图片"
+          onChange={(event) => { void addImages(Array.from(event.target.files ?? [])); event.target.value = ''; }} />
         <label className="sr-only" htmlFor="chat-input">
           输入你的问题
         </label>
@@ -653,6 +784,10 @@ export default function ChatWorkspace({ user, profileLoading, profileError, conn
           ref={inputRef}
           value={draft}
           onChange={(event) => setDraft(event.target.value)}
+          onPaste={(event) => {
+            const files = Array.from(event.clipboardData.files).filter((file) => file.type.startsWith('image/'));
+            if (files.length) { event.preventDefault(); void addImages(files); }
+          }}
           onKeyDown={handleInputKey}
           onCompositionStart={() => {
             composingRef.current = true;
@@ -667,15 +802,29 @@ export default function ChatWorkspace({ user, profileLoading, profileError, conn
           rows={1}
         />
         <div className="composer-toolbar">
-          <span
-            className="model-caption"
-            role="status"
-            aria-label="当前模型"
-            title={active ? `会话模型：${displayedModel}` : `新会话默认模型：${displayedModel}`}
-          >
-            <Cpu size={14} strokeWidth={1.5} aria-hidden="true" />
-            <span>{displayedModel}</span>
-          </span>
+          <div className="composer-tools">
+            <button type="button" className="icon-button" onClick={() => {
+              if (supportsImages === false) {
+                setToast(`模型 ${selectedModel} 仅支持文字，请切换到视觉模型后再发图`);
+                return;
+              }
+              fileInputRef.current?.click();
+            }}
+              disabled={!user || savingModel || creating || !!pending || !!active?.generating || uploadingImages || draftImages.length >= 4}
+              aria-label="添加图片" title="添加图片，也可粘贴截图"><ImagePlus size={18} /></button>
+            <label className={`model-selector ${savingModel ? 'is-saving' : ''}`} title={savingModel ? '正在保存模型选择' : '选择对话模型'}>
+              {savingModel ? <span className="small-spinner" /> : <Cpu size={14} strokeWidth={1.5} aria-hidden="true" />}
+              <select aria-label="选择模型" value={selectedModel} onChange={(event) => { void changeModel(event.target.value); }}
+                disabled={!user || savingModel || creating || !!pending || !!active?.generating || restoringConversation || !modelOptions.length}>
+                {!modelOptions.some((item) => item.model === selectedModel) &&
+                  <option value={selectedModel} disabled>{displayedModel}</option>}
+                {modelOptions.map((item) => <option key={item.model} value={item.model}>
+                  {item.model}{item.image_input_supported === true ? ' · 图文' : item.image_input_supported === false ? ' · 文字' : ''}
+                </option>)}
+              </select>
+              <ChevronDown size={12} aria-hidden="true" />
+            </label>
+          </div>
           {isActivePending ? (
             <button
               className="send-button stop-button"
@@ -691,7 +840,7 @@ export default function ChatWorkspace({ user, profileLoading, profileError, conn
             <button
               className="send-button"
               type="submit"
-              disabled={!draft.trim() || !user || !!pending || creating || historyLoading || !!historyError || restoringConversation || !!active?.generating || (!!activeId && renaming?.id === activeId) || draft.trim().length > 20000}
+              disabled={(!draft.trim() && !draftImages.length) || uploadingImages || draftImages.some((item) => item.status !== 'ready') || !user || savingModel || !!pending || creating || historyLoading || !!historyError || restoringConversation || !!active?.generating || (!!activeId && renaming?.id === activeId) || draft.trim().length > 20000}
               aria-label="发送消息"
               title={active?.generating && !isActivePending ? '正在核对生成状态，请稍候' : pending ? '另一段对话正在回答，请稍候' : '发送消息'}
             >
@@ -924,6 +1073,12 @@ export default function ChatWorkspace({ user, profileLoading, profileError, conn
                 >
                   {message.role === 'user' ? (
                     <>
+                      {!!message.attachments?.length && <div className="message-images">
+                        {message.attachments.map((image) => <a key={image.id} href={attachmentUrl(image)}
+                          target="_blank" rel="noreferrer" title={`查看原图：${image.name}`}>
+                          <img src={attachmentUrl(image)} alt={image.name} loading="lazy" />
+                        </a>)}
+                      </div>}
                       <div className="user-message">{message.content}</div>
                     </>
                   ) : (
@@ -955,7 +1110,7 @@ export default function ChatWorkspace({ user, profileLoading, profileError, conn
                           <p>{message.status === 'error' ? `生成失败：${message.notice ?? '请重试'}` : message.notice ?? '已停止生成'}</p>
                           {active?.generating && <p role="status">正在确认生成状态…</p>}
                           <button className="text-button" onClick={() => retryMessage(message.id)}
-                            disabled={!!pending || !!active?.generating}>
+                            disabled={savingModel || !!pending || !!active?.generating}>
                             <RotateCcw size={13} />
                             {message.status === 'error' ? '重试' : '重新回答'}
                           </button>
@@ -971,7 +1126,7 @@ export default function ChatWorkspace({ user, profileLoading, profileError, conn
                             >
                               {copiedId === message.id ? <Check size={15} /> : <Copy size={15} />}
                             </button>
-
+                            {message.model && <span title="这条回答实际使用的模型">{message.model}</span>}
                           </div>
                         </>
                       )}

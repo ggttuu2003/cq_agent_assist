@@ -3,7 +3,7 @@
 from functools import lru_cache
 from typing import Literal
 
-from pydantic import SecretStr
+from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -22,6 +22,8 @@ class Settings(BaseSettings):
     llm_base_url: str = ""
     llm_api_key: SecretStr = SecretStr("")
     llm_model: str = ""
+    # 允许在页面选择的其他模型，环境变量使用 JSON 数组；默认模型始终包含在列表中。
+    llm_models: list[str] = Field(default_factory=list)
     llm_timeout: float = 60
 
     # DDGS 不需要搜索 Key；选择 Tavily 时才读取 tavily_api_key。

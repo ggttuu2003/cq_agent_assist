@@ -9,6 +9,31 @@ from app.core.settings import Settings
 from app.llm.errors import ModelConfigurationError
 
 
+def available_models(settings: Settings) -> list[str]:
+    """默认模型和额外配置合并去重，保持配置顺序，不向上游查询模型。"""
+    return list(dict.fromkeys(name.strip() for name in [settings.llm_model, *settings.llm_models] if name.strip()))
+
+
+def select_model(settings: Settings, requested: str | None) -> str:
+    """选择默认或明确请求的模型，只允许使用后端已开放的模型名称。"""
+    model_name = requested.strip() if requested is not None else settings.llm_model.strip()
+    if not model_name:
+        raise ModelConfigurationError("请先配置新会话的默认模型 LLM_MODEL，或选择一个可用模型")
+    if model_name not in available_models(settings):
+        raise ValueError("该模型未配置为可选模型，请刷新模型列表后重新选择")
+    return model_name
+
+
+def image_input_support(model_name: str) -> bool | None:
+    """识别已知模型的图片能力；未知模型交给实际服务判断，不一律禁止。"""
+    name = model_name.strip().lower()
+    if name in {"qwen-plus", "qwen-turbo", "qwen-max"}:
+        return False
+    if name.startswith(("qwen-vl-", "qwen2-vl-", "qwen2.5-vl-", "qwen3-vl-")):
+        return True
+    return None
+
+
 def create_chat_model(settings: Settings, client: httpx.AsyncClient) -> ChatOpenAI:
     """读取服务地址、密钥和模型名，创建供 LangGraph 节点使用的模型客户端。
 

@@ -5,6 +5,8 @@
 fastapi>=0.115,<1.0
 uvicorn[standard]>=0.34,<1.0
 anyio>=4,<5  # 管理流式响应的并发任务和取消清理
+python-multipart>=0.0.20,<1.0  # 接收图片上传表单
+Pillow>=12,<13  # 检查图片的真实格式、尺寸和完整性
 
 # 配置与数据校验
 pydantic>=2.10,<3.0

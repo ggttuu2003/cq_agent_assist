@@ -12,6 +12,7 @@ from app.api.profile import router as profile_router
 from app.api.chat import router as chat_router
 from app.api.conversations import router as conversations_router
 from app.api.health import router as health_router
+from app.api.attachments import router as attachments_router
 from app.core.settings import get_settings
 from app.core.logging import RequestLoggingMiddleware, configure_logging
 from app.db.database import create_database, initialize_database
@@ -79,6 +80,7 @@ app.include_router(profile_router)
 app.include_router(conversations_router)
 app.include_router(chat_router)
 app.include_router(health_router)
+app.include_router(attachments_router)
 
 # 使用 ASGI 中间件包住完整响应，避免把“响应头已返回”当作流式生成完成。
 app.add_middleware(RequestLoggingMiddleware)

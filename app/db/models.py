@@ -49,6 +49,30 @@ class Conversation(Base):
     )
 
 
+class Attachment(Base):
+    """独立保存的附件资料；实际文件放在本地 data/attachments 目录。"""
+    __tablename__ = "cq_attachment"
+    __table_args__ = {**Base.__table_args__, "comment": "用户上传的附件"}
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, comment="附件UUID，也是文件存储编号")
+    user_id: Mapped[int] = mapped_column(ForeignKey("cq_user.id", ondelete="CASCADE"), index=True, comment="所属用户")
+    name: Mapped[str] = mapped_column(String(200), comment="显示的文件名，不用于拼接磁盘路径")
+    media_type: Mapped[str] = mapped_column(String(60), comment="经过校验的媒体类型")
+    size: Mapped[int] = mapped_column(Integer, comment="文件大小，字节")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, comment="上传时间，UTC")
+
+
+class MessageAttachment(Base):
+    """记录图片在消息中的顺序，保证追问“第一张图”时顺序不会改变。"""
+    __tablename__ = "cq_message_attachment"
+    __table_args__ = {**Base.__table_args__, "comment": "消息与附件的有序关联"}
+
+    message_id: Mapped[str] = mapped_column(ForeignKey("cq_message.id", ondelete="CASCADE"), primary_key=True)
+    attachment_id: Mapped[str] = mapped_column(ForeignKey("cq_attachment.id", ondelete="CASCADE"), primary_key=True)
+    position: Mapped[int] = mapped_column(Integer, comment="本消息内的附件顺序，从0开始")
+    attachment: Mapped[Attachment] = relationship(lazy="raise")
+
+
 class Message(Base):
     """只保存成功完成的一轮问答，问题和回答在同一事务写入。"""
     __tablename__ = "cq_message"
@@ -66,3 +90,11 @@ class Message(Base):
     content: Mapped[str] = mapped_column(Text().with_variant(LONGTEXT(), "mysql"), comment="消息正文")
     model: Mapped[str | None] = mapped_column(String(200), nullable=True, comment="回答使用的模型，用户消息为空")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, comment="保存时间，UTC")
+    attachment_links: Mapped[list[MessageAttachment]] = relationship(
+        order_by=MessageAttachment.position, cascade="all, delete-orphan", passive_deletes=True, lazy="raise",
+    )
+
+    @property
+    def attachments(self) -> list[Attachment]:
+        """按发送顺序取附件，关联的加载由查询显式完成，不触发隐式数据库请求。"""
+        return [link.attachment for link in self.attachment_links]

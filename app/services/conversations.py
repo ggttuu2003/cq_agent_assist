@@ -7,16 +7,28 @@ from datetime import timedelta, timezone
 from time import perf_counter
 from uuid import uuid4
 
+import anyio
 from fastapi import HTTPException
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from app.db.models import Conversation, Message, utc_now
+from app.db.models import Conversation, Message, MessageAttachment, utc_now
 from app.llm.errors import ModelError
-from app.schemas.conversations import ConversationInfo, ConversationTurnInfo, MessageInfo, SendMessageRequest
+from app.llm.factory import image_input_support
+from app.schemas.conversations import ConversationInfo, ConversationModelInfo, ConversationTurnInfo, MessageInfo, SendMessageRequest
+from app.services.attachments import (
+    MAX_IMAGES, MAX_IMAGE_TOTAL_SIZE, attachment_info, get_attachments, message_content,
+)
 
 logger = logging.getLogger(__name__)
+
+
+def message_info(message: Message) -> MessageInfo:
+    """消息正文与附件描述一起返回，图片内容由独立接口读取。"""
+    return MessageInfo(id=message.id, role=message.role, content=message.content, model=message.model,
+                       request_id=message.request_id,
+                       attachments=[attachment_info(item) for item in message.attachments])
 
 
 def conversation_info(conversation: Conversation) -> ConversationInfo:
@@ -24,10 +36,10 @@ def conversation_info(conversation: Conversation) -> ConversationInfo:
     return ConversationInfo(
         id=conversation.id, title=conversation.title,
         model_name=conversation.model_name,
+        image_input_supported=image_input_support(conversation.model_name),
         updated_at=conversation.updated_at.replace(tzinfo=timezone.utc),
         generating=bool(conversation.busy_until and conversation.busy_until > utc_now()),
-        messages=[MessageInfo(id=m.id, role=m.role, content=m.content, model=m.model,
-                              request_id=m.request_id) for m in conversation.messages],
+        messages=[message_info(message) for message in conversation.messages],
     )
 
 
@@ -35,7 +47,8 @@ async def list_user_conversations(db: AsyncSession, user_id: int) -> list[Conver
     """按更新时间读取当前个人资料的会话和消息。"""
     rows = await db.scalars(select(Conversation).where(
         Conversation.user_id == user_id,
-    ).options(selectinload(Conversation.messages)).order_by(
+    ).options(selectinload(Conversation.messages).selectinload(Message.attachment_links)
+              .selectinload(MessageAttachment.attachment)).order_by(
         Conversation.updated_at.desc(), Conversation.id,
     ))
     return list(rows)
@@ -73,6 +86,21 @@ async def rename_user_conversation(db: AsyncSession, user_id: int, conversation_
     return await get_user_conversation(db, user_id, conversation_id)
 
 
+async def switch_conversation_model(db: AsyncSession, user_id: int, conversation_id: str,
+                                    model_name: str) -> ConversationModelInfo:
+    """短事务内切换模型；生成占用期间不允许修改，历史回答的模型记录保持原值。"""
+    await db.commit()
+    conversation = await owned_conversation(db, user_id, conversation_id, lock=True)
+    if conversation.busy_until and conversation.busy_until > utc_now():
+        raise HTTPException(409, "会话正在回答，请停止或等待完成后再切换模型")
+    previous_model = conversation.model_name
+    conversation.model_name = model_name
+    await db.commit()
+    logger.info("会话模型切换成功 会话=%s 原模型=%s 新模型=%s", conversation_id, previous_model, model_name)
+    return ConversationModelInfo(id=conversation_id, model_name=model_name,
+                                 image_input_supported=image_input_support(model_name))
+
+
 async def owned_conversation(db: AsyncSession, user_id: int, conversation_id: str, *, lock=False):
     """只读取属于当前个人档案的会话；没有匹配记录时返回 404。"""
     query = select(Conversation).where(
@@ -81,7 +109,8 @@ async def owned_conversation(db: AsyncSession, user_id: int, conversation_id: st
     if lock:
         query = query.with_for_update()
     else:
-        query = query.options(selectinload(Conversation.messages)).execution_options(populate_existing=True)
+        query = query.options(selectinload(Conversation.messages).selectinload(Message.attachment_links)
+                              .selectinload(MessageAttachment.attachment))
     conversation = await db.scalar(query)
     if not conversation:
         raise HTTPException(404, "会话不存在")
@@ -93,17 +122,25 @@ async def get_user_conversation(db: AsyncSession, user_id: int, conversation_id:
     return await owned_conversation(db, user_id, conversation_id, lock=lock)
 
 
-def model_history(messages: list[Message]) -> list[tuple[str, str]]:
-    """最多保留最近 20 轮，并按完整问答控制历史字符总量。"""
+def model_history(messages: list[Message], image_count=0, image_size=0,
+                  include_images=True) -> list[tuple[str, str | list[dict]]]:
+    """按整轮保留最近历史，文字和图片都设上限；生产调用放在工作线程读文件。"""
     rounds = []
     total = 0
+    messages = messages[-40:]
     for index in range(len(messages) - 2, -1, -2):
         pair = messages[index:index + 2]
         size = sum(len(message.content) for message in pair)
-        if total + size > 60000:
+        images = [item for message in pair for item in message.attachments] if include_images else []
+        pair_image_size = sum(item.size for item in images)
+        if (total + size > 60000 or image_count + len(images) > MAX_IMAGES
+                or image_size + pair_image_size > MAX_IMAGE_TOTAL_SIZE):
             break
-        rounds.insert(0, [(message.role, message.content) for message in pair])
+        rounds.insert(0, [(message.role, message_content(message.content,
+                          [attachment_info(item) for item in message.attachments] if include_images else [])) for message in pair])
         total += size
+        image_count += len(images)
+        image_size += pair_image_size
     return [message for pair in rounds for message in pair]
 
 
@@ -129,7 +166,8 @@ class Generation:
     duration: float
     lease: str | None = None
     model_name: str = ""
-    history: list[tuple[str, str]] = field(default_factory=list)
+    history: list[tuple[str, str | list[dict]]] = field(default_factory=list)
+    current_content: str | list[dict] | None = None
     sequence: int = 0
     saved: ConversationTurnInfo | None = None
 
@@ -139,8 +177,7 @@ def turn_info(conversation: Conversation, request_id: str, messages: list[Messag
     return ConversationTurnInfo(
         request_id=request_id, conversation_id=conversation.id,
         updated_at=conversation.updated_at.replace(tzinfo=timezone.utc),
-        messages=[MessageInfo(id=m.id, role=m.role, content=m.content, model=m.model,
-                              request_id=m.request_id) for m in messages],
+        messages=[message_info(message) for message in messages],
     )
 
 
@@ -160,11 +197,13 @@ async def prepare_generation(db: AsyncSession, user_id: int, conversation_id: st
     generation.model_name = conversation.model_name
     previous = list((await db.scalars(select(Message).where(
         Message.conversation_id == conversation_id, Message.request_id == request_id,
-    ).order_by(Message.sequence))).all())
+    ).options(selectinload(Message.attachment_links).selectinload(MessageAttachment.attachment))
+        .order_by(Message.sequence))).all())
     if previous:
-        if previous[0].content != body.message:
+        if (previous[0].content != body.message or
+                [item.id for item in previous[0].attachments] != [str(item) for item in body.attachment_ids]):
             logger.warning("消息编号被用于不同问题 会话=%s 消息请求=%s", conversation_id, request_id)
-            raise HTTPException(409, "同一个请求编号不能用于不同的问题")
+            raise HTTPException(409, "同一个请求编号不能用于不同的问题或图片")
         generation.saved = turn_info(conversation, request_id, previous)
         await db.commit()
         logger.info("重放已保存的问答 会话=%s 消息请求=%s", conversation_id, request_id)
@@ -172,6 +211,12 @@ async def prepare_generation(db: AsyncSession, user_id: int, conversation_id: st
     if conversation.busy_until and conversation.busy_until > utc_now():
         logger.warning("会话正忙，拒绝重复生成 会话=%s 消息请求=%s", conversation_id, request_id)
         raise HTTPException(409, "这段会话正在回答，请稍候再试")
+    supports_images = image_input_support(conversation.model_name)
+    if body.attachment_ids and supports_images is False:
+        logger.warning("拒绝向纯文本模型发送图片 会话=%s 模型=%s 图片数=%s",
+                       conversation_id, conversation.model_name, len(body.attachment_ids))
+        raise HTTPException(422, f"当前会话使用 {conversation.model_name}，仅支持文字；请切换到视觉模型后再发送图片")
+    attachments = await get_attachments(db, user_id, [str(item) for item in body.attachment_ids])
     # 给本次执行生成一个内部编号，再把“谁在回答、最晚占用到何时”写入会话表。
     # 后续请求看到尚未到期的标记，就不能在同一会话里同时开始另一轮回答。
     # 到期时间用于服务异常退出、来不及清理标记时，允许后续请求恢复使用会话。
@@ -180,12 +225,26 @@ async def prepare_generation(db: AsyncSession, user_id: int, conversation_id: st
     conversation.busy_until = utc_now() + timedelta(seconds=generation.duration + 30)
     history_rows = list((await db.scalars(select(Message).where(
         Message.conversation_id == conversation_id,
-    ).order_by(Message.sequence.desc()).limit(40))).all())[::-1]
-    generation.history = model_history(history_rows)
+    ).options(selectinload(Message.attachment_links).selectinload(MessageAttachment.attachment))
+        .order_by(Message.sequence.desc()).limit(40))).all())[::-1]
     generation.sequence = history_rows[-1].sequence if history_rows else 0
     await db.commit()
-    logger.info("生成准备完成 会话=%s 消息请求=%s 模型=%s 历史消息数=%s 耗时=%.0fms", conversation_id,
-                request_id, generation.model_name, len(generation.history), (perf_counter() - started) * 1000)
+    try:
+        # 先释放行锁和连接，再读图和编码，避免持锁等待文件处理。
+        generation.current_content = await anyio.to_thread.run_sync(
+            message_content, body.message, [attachment_info(item) for item in attachments],
+        )
+        generation.history = await anyio.to_thread.run_sync(
+            model_history, history_rows, len(attachments), sum(item.size for item in attachments),
+            supports_images is not False,
+        )
+    except BaseException:
+        # 领取占用后，即使图片丢失或客户端取消，也必须释放本次占用。
+        with anyio.CancelScope(shield=True):
+            await release_generation(db, user_id, conversation_id, generation.lease)
+        raise
+    logger.info("生成准备完成 会话=%s 消息请求=%s 模型=%s 历史消息数=%s 本轮图片数=%s 耗时=%.0fms", conversation_id,
+                request_id, generation.model_name, len(generation.history), len(attachments), (perf_counter() - started) * 1000)
     return generation
 
 
@@ -203,11 +262,14 @@ async def save_generation(db: AsyncSession, generation: Generation, reply: str) 
     conversation.active_request = None
     conversation.busy_until = None
     request_id = str(generation.body.request_id)
+    attachments = await get_attachments(db, generation.user_id, [str(item) for item in generation.body.attachment_ids])
     messages = [
         Message(id=str(uuid4()), conversation_id=generation.conversation_id, sequence=generation.sequence + 1,
-                request_id=request_id, role="user", content=generation.body.message),
+                request_id=request_id, role="user", content=generation.body.message,
+                attachment_links=[MessageAttachment(position=index, attachment=item)
+                                  for index, item in enumerate(attachments)]),
         Message(id=str(uuid4()), conversation_id=generation.conversation_id, sequence=generation.sequence + 2,
-                request_id=request_id, role="assistant", content=reply, model=generation.model_name),
+                request_id=request_id, role="assistant", content=reply, model=generation.model_name, attachment_links=[]),
     ]
     db.add_all(messages)
     result = turn_info(conversation, request_id, messages)
@@ -217,14 +279,14 @@ async def save_generation(db: AsyncSession, generation: Generation, reply: str) 
     return result
 
 
-async def answer_message(db: AsyncSession, user_id: int, conversation_id: str,
-                         body: SendMessageRequest, agent, timeout: float):
+async def answer_message(db: AsyncSession, generation: Generation, agent):
     """普通 JSON 发送：共用生成逻辑，等待完整回答后返回会话。"""
-    generation = await prepare_generation(db, user_id, conversation_id, body, timeout)
+    user_id, conversation_id, body = generation.user_id, generation.conversation_id, generation.body
     if not generation.saved:
         try:
             async with asyncio.timeout(generation.duration):
-                result = await agent.ainvoke({"messages": [*generation.history, ("user", body.message)]})
+                result = await agent.ainvoke({"messages": [*generation.history,
+                                                          ("user", generation.current_content or body.message)]})
             await save_generation(db, generation, result["messages"][-1].text)
         except BaseException as exc:
             if isinstance(exc, asyncio.CancelledError):

@@ -6,11 +6,12 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from langgraph.graph.state import CompiledStateGraph
 
-from app.dependencies import CurrentUser, Db, get_conversation_agent
+from app.dependencies import CurrentUser, Db, PreparedGeneration, get_conversation_agent
 from app.db.models import utc_now
-from app.llm.errors import ModelError
+from app.llm.errors import ModelConfigurationError, ModelError
+from app.llm.factory import select_model
 from app.schemas.conversations import (
-    ConversationInfo, ConversationTitleUpdate, CreateConversationRequest, SendMessageRequest,
+    ConversationInfo, ConversationModelInfo, ConversationModelUpdate, ConversationTitleUpdate, CreateConversationRequest,
 )
 from app.services.conversations import (
     answer_message,
@@ -19,8 +20,8 @@ from app.services.conversations import (
     delete_user_conversation,
     get_user_conversation,
     list_user_conversations,
-    prepare_generation,
     rename_user_conversation,
+    switch_conversation_model,
 )
 from app.services.streaming import ConversationStreamResponse
 
@@ -37,10 +38,12 @@ async def list_conversations(user: CurrentUser, db: Db):
 async def create_conversation(body: CreateConversationRequest, request: Request,
                               user: CurrentUser, db: Db):
     """根据首次问题创建会话并保存标题，此时不调用模型。"""
-    # 新会话绑定创建时的默认模型；已有会话不会随全局配置变化。
-    model_name = request.app.state.settings.llm_model.strip()
-    if not model_name:
-        raise HTTPException(503, "请先配置新会话的默认模型 LLM_MODEL")
+    try:
+        model_name = select_model(request.app.state.settings, body.model_name)
+    except ModelConfigurationError as exc:
+        raise HTTPException(503, str(exc)) from None
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from None
     return conversation_info(await create_user_conversation(db, user.id, model_name, body.first_message))
 
 
@@ -59,6 +62,17 @@ async def rename_conversation(conversation_id: UUID, body: ConversationTitleUpda
     ))
 
 
+@router.patch("/{conversation_id}/model", response_model=ConversationModelInfo)
+async def change_conversation_model(conversation_id: UUID, body: ConversationModelUpdate,
+                                    request: Request, user: CurrentUser, db: Db):
+    """校验可选模型并保存到会话，后续问题使用新模型。"""
+    try:
+        model_name = select_model(request.app.state.settings, body.model_name)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from None
+    return await switch_conversation_model(db, user.id, str(conversation_id), model_name)
+
+
 @router.delete("/{conversation_id}", status_code=204)
 async def delete_conversation(conversation_id: UUID, user: CurrentUser, db: Db):
     """删除会话及其消息。"""
@@ -70,13 +84,11 @@ async def delete_conversation(conversation_id: UUID, user: CurrentUser, db: Db):
 
 
 @router.post("/{conversation_id}/messages", response_model=ConversationInfo)
-async def send_message(conversation_id: UUID, body: SendMessageRequest, request: Request,
-                       user: CurrentUser, db: Db,
+async def send_message(generation: PreparedGeneration, db: Db,
                        agent: Annotated[CompiledStateGraph, Depends(get_conversation_agent)]):
     """提交消息，业务层负责读取上下文、调用图并保存结果。"""
     try:
-        return await answer_message(db, user.id, str(conversation_id), body, agent,
-                                    request.app.state.settings.llm_timeout)
+        return await answer_message(db, generation, agent)
     except ModelError as exc:
         raise HTTPException(502, str(exc)) from None
     except TimeoutError:
@@ -84,8 +96,7 @@ async def send_message(conversation_id: UUID, body: SendMessageRequest, request:
 
 
 @router.post("/{conversation_id}/messages/stream", response_class=ConversationStreamResponse, status_code=200)
-async def stream_message(conversation_id: UUID, body: SendMessageRequest, request: Request,
-                         user: CurrentUser, db: Db,
+async def stream_message(request: Request, generation: PreparedGeneration,
                          agent: Annotated[CompiledStateGraph, Depends(get_conversation_agent)]):
     """先检查会话是否存在、请求是否重复，以及该会话是否正在回答。
 
@@ -93,6 +104,4 @@ async def stream_message(conversation_id: UUID, body: SendMessageRequest, reques
     这样校验失败仍能返回正常的 HTTP 错误，而不是先返回 200 再报告错误。
     等待模型回答期间不一直占用数据库连接。
     """
-    generation = await prepare_generation(db, user.id, str(conversation_id), body,
-                                          request.app.state.settings.llm_timeout)
     return ConversationStreamResponse(request.app.state.db_sessions, generation, agent)

@@ -13,6 +13,7 @@ from langchain_core.messages import AIMessage, AIMessageChunk
 from pydantic import SecretStr
 from sqlalchemy.exc import SQLAlchemyError
 
+from app import dependencies as conversation_dependencies
 from app.api import conversations as conversation_api
 from app.db.models import Conversation, User, utc_now
 from app.dependencies import get_conversation_agent
@@ -201,14 +202,14 @@ class TestStreaming(unittest.IsolatedAsyncioTestCase):
         """首字等待期间有心跳，总时限到达后发送错误并释放占用。"""
         cid = await self.prepare_conversation()
         self.agent.allow_first = asyncio.Event()
-        original = conversation_api.prepare_generation
+        original = conversation_dependencies.prepare_generation
 
         async def short_generation(*args):
             generation = await original(*args)
             generation.duration = 0.08
             return generation
 
-        with patch.object(conversation_api, "prepare_generation", short_generation), \
+        with patch.object(conversation_dependencies, "prepare_generation", short_generation), \
                 patch.object(ConversationStreamResponse, "heartbeat_seconds", 0.02):
             response = await self.stream(cid, {"message": "超时", "request_id": str(uuid4())})
         self.assertIn(": ping\n\n", response.text)

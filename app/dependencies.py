@@ -4,6 +4,7 @@ from typing import Annotated
 import logging
 from uuid import UUID
 
+import anyio
 from fastapi import Depends, HTTPException, Request
 from langgraph.graph.state import CompiledStateGraph
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -14,7 +15,8 @@ from app.db.models import User
 from app.llm.errors import ModelConfigurationError
 from app.llm.factory import create_chat_model
 from app.search.factory import create_search_provider
-from app.services.conversations import get_user_conversation
+from app.schemas.conversations import SendMessageRequest
+from app.services.conversations import Generation, prepare_generation, release_generation
 from app.tools.web_search import web_search
 
 Db = Annotated[AsyncSession, Depends(get_db)]
@@ -63,9 +65,28 @@ async def get_agent(request: Request) -> CompiledStateGraph:
     return get_model_agent(request, request.app.state.settings.llm_model)
 
 
+async def get_generation(
+    conversation_id: UUID, body: SendMessageRequest, request: Request, user: CurrentUser, db: Db,
+) -> Generation:
+    """先领取生成占用，再选择模型，防止切换模型与发送消息互相穿插。"""
+    return await prepare_generation(db, user.id, str(conversation_id), body,
+                                    request.app.state.settings.llm_timeout)
+
+
+# 同一请求中 FastAPI 会缓存依赖返回值，接口与选图依赖共用一次准备结果。
+PreparedGeneration = Annotated[Generation, Depends(get_generation)]
+
+
 async def get_conversation_agent(
-    conversation_id: UUID, request: Request, user: CurrentUser, db: Db,
-) -> CompiledStateGraph:
-    """核对会话归属后，按会话绑定的模型提供对应的图。"""
-    conversation = await get_user_conversation(db, user.id, str(conversation_id))
-    return get_model_agent(request, conversation.model_name)
+    request: Request, generation: PreparedGeneration, db: Db,
+) -> CompiledStateGraph | None:
+    """按本轮已锁定的模型选图；重放已保存回答不需要创建模型客户端。"""
+    if generation.saved:
+        return None
+    try:
+        return get_model_agent(request, generation.model_name)
+    except BaseException:
+        # 配置错误发生在领取占用之后，也要释放标记，避免会话一直显示正在回答。
+        with anyio.CancelScope(shield=True):
+            await release_generation(db, generation.user_id, generation.conversation_id, generation.lease)
+        raise

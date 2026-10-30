@@ -117,7 +117,7 @@ class ConversationStreamResponse(StreamingResponse):
         # messages 提供实时文字；updates 提供节点完成后的模型消息或工具执行结果。
         # 同时读取两种模式，才能区分“模型选择工具”和“模型给出最终回答”。
         async with aclosing(self.agent.astream({
-            "messages": [*generation.history, ("user", generation.body.message)],
+            "messages": [*generation.history, ("user", generation.current_content or generation.body.message)],
         }, stream_mode=["messages", "updates"])) as events:
             async for mode, data in events:
                 if mode == "messages":
