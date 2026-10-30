@@ -63,7 +63,9 @@ class TestAgentGraph(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(request.headers["Authorization"], "Bearer test-key")
                     payload = json.loads(request.content)
                     self.assertEqual(payload["model"], name)
-                    self.assertEqual(payload["messages"], [{"role": "user", "content": "你好"}])
+                    self.assertEqual(payload["messages"][0]["role"], "system")
+                    self.assertIn("未配置联网搜索", payload["messages"][0]["content"])
+                    self.assertEqual(payload["messages"][1:], [{"role": "user", "content": "你好"}])
                     return httpx.Response(200, json=model_response("你好！"))
 
                 async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:

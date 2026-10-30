@@ -16,6 +16,7 @@ import {
   Check,
   Copy,
   Cpu,
+  Globe,
   Pencil,
   MessageSquare,
   UserRound,
@@ -400,7 +401,8 @@ export default function ChatWorkspace({ user, profileLoading, profileError, conn
           ? {
               ...conversation,
               messages: conversation.messages.map((message) =>
-                message.id === messageId ? { ...message, content, status, notice: undefined } : message,
+                message.id === messageId ? { ...message, content, status, notice: undefined,
+                  toolCalls: status === 'pending' ? [] : message.toolCalls } : message,
               ),
             }
           : conversation,
@@ -447,6 +449,19 @@ export default function ChatWorkspace({ user, profileLoading, profileError, conn
           ...item, messages: item.messages.map((message) => message.id === messageId
             ? { ...message, content: message.content + text } : message),
         } : item));
+      }, (event) => {
+        if (controller.signal.aborted) return;
+        // 只更新当前请求对应的回答，切换会话后也不会把搜索状态写到别的会话。
+        setConversations((items) => items.map((item) => item.id === conversationId ? {
+          ...item, messages: item.messages.map((message) => {
+            if (message.id !== messageId) return message;
+            if (event.type === 'answer_reset') return { ...message, content: '' };
+            const calls = message.toolCalls ?? [];
+            return { ...message, toolCalls: calls.some((call) => call.id === event.call.id)
+              ? calls.map((call) => call.id === event.call.id ? event.call : call)
+              : [...calls, event.call] };
+          }),
+        } : item));
       });
       if (!controller.signal.aborted) applyTurn(turn, messageId);
     } catch (error) {
@@ -455,7 +470,9 @@ export default function ChatWorkspace({ user, profileLoading, profileError, conn
         error instanceof Error ? error.message : '生成失败，请重试。';
       setConversations((items) => items.map((item) => item.id === conversationId ? {
         ...item, messages: item.messages.map((message) => message.id === messageId
-          ? { ...message, status: cancelled ? 'cancelled' : 'error', notice } : message),
+          ? { ...message, status: cancelled ? 'cancelled' : 'error', notice,
+            toolCalls: message.toolCalls?.map((call) => call.status === 'running'
+              ? { ...call, status: cancelled ? 'cancelled' : 'error', error: cancelled ? '搜索已停止' : notice } : call) } : message),
       } : item));
       await reconcileAnswer(conversationId, messageId);
     } finally {
@@ -915,6 +932,15 @@ export default function ChatWorkspace({ user, profileLoading, profileError, conn
                         <BrandMark />
                         <span>CQ Assist</span>
                       </div>
+                      {message.toolCalls?.map((call) => (
+                        <div key={call.id} className={`tool-progress tool-${call.status}`} role="status">
+                          {call.status === 'running' ? <span className="small-spinner" /> : <Globe size={14} />}
+                          <span>{call.status === 'running' ? '正在搜索网页' : call.status === 'completed'
+                            ? call.sources.length ? `已搜索 ${call.sources.length} 个网页` : '未找到相关结果'
+                            : call.error ?? '搜索失败'}</span>
+                          <span className="tool-query" title={call.query}>{call.query}</span>
+                        </div>
+                      ))}
                       {message.content && (
                         <Suspense fallback={<div className="markdown markdown-loading">{message.content}</div>}>
                           <Markdown content={message.content} />

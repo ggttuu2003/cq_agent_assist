@@ -4,10 +4,11 @@ import asyncio
 import json
 import logging
 from contextlib import aclosing
+from time import perf_counter
 
 import anyio
 from fastapi import HTTPException
-from langchain_core.messages import AIMessageChunk
+from langchain_core.messages import AIMessageChunk, ToolMessage
 from sqlalchemy.exc import SQLAlchemyError
 from starlette.responses import StreamingResponse
 from starlette.types import Receive, Scope, Send
@@ -40,6 +41,11 @@ class ConversationStreamResponse(StreamingResponse):
         self.sessions = sessions
         self.generation = generation
         self.agent = agent
+        self.started_at = perf_counter()
+        self.first_text_received = False
+        self.failed = False
+        # 只累积当前模型回答；模型转去调用工具时清空，最终不会保存过渡文字。
+        self.reply = ""
         # completed 表示问答已保存成功，不表示“已经输出过文字”。
         # 重试时若查到了已保存问答，直接重放结果，所以初始值也可能为 True。
         self.completed = generation.saved is not None
@@ -54,6 +60,9 @@ class ConversationStreamResponse(StreamingResponse):
         """同时监听断开和发送数据，等待第一个片段时也能响应停止。"""
         # 框架通过 await response(scope, receive, send) 进入这里。
         # scope 是请求信息；receive 接收断开等事件；send 用于发送响应头和正文。
+        logger.info("流式回答开始 会话=%s 消息请求=%s 模型=%s 重放=%s",
+                    self.generation.conversation_id, self.generation.body.request_id,
+                    self.generation.model_name, self.completed)
         try:
             async with anyio.create_task_group() as group:
                 # 启动发送任务，与下面的断开监听并发执行，不是创建两条线程。
@@ -80,7 +89,12 @@ class ConversationStreamResponse(StreamingResponse):
                                                              self.generation.conversation_id,
                                                              self.generation.lease)
                         except Exception:
-                            logger.exception("流式生成占用清理失败，将由占用到期机制恢复")
+                            logger.exception("流式生成占用清理失败，将由占用到期机制恢复 会话=%s 消息请求=%s",
+                                             self.generation.conversation_id, self.generation.body.request_id)
+                    outcome = "已保存" if self.completed else "失败" if self.failed else "取消或连接断开"
+                    logger.info("流式回答结束 会话=%s 消息请求=%s 结果=%s 耗时=%.0fms",
+                                self.generation.conversation_id, self.generation.body.request_id,
+                                outcome, (perf_counter() - self.started_at) * 1000)
 
     async def send_events(self, send: Send, cancel_scope: anyio.CancelScope):
         """发送结束或浏览器断开后，让另一个监听任务一同退出。"""
@@ -94,16 +108,80 @@ class ConversationStreamResponse(StreamingResponse):
             # 发送正常结束或失败后，另一个任务都无需继续等待客户端断开。
             cancel_scope.cancel()
 
+    async def graph_events(self):
+        """把模型片段和节点结果转换成页面事件，工具名称与搜索服务商无关。"""
+        generation = self.generation
+        request_id = str(generation.body.request_id)
+        calls = {}
+        final_received = False
+        # messages 提供实时文字；updates 提供节点完成后的模型消息或工具执行结果。
+        # 同时读取两种模式，才能区分“模型选择工具”和“模型给出最终回答”。
+        async with aclosing(self.agent.astream({
+            "messages": [*generation.history, ("user", generation.body.message)],
+        }, stream_mode=["messages", "updates"])) as events:
+            async for mode, data in events:
+                if mode == "messages":
+                    message, metadata = data
+                    if metadata.get("langgraph_node") == "model" and isinstance(message, AIMessageChunk):
+                        if message.text:
+                            if not self.first_text_received:
+                                self.first_text_received = True
+                                logger.info("收到模型首个文本片段 会话=%s 消息请求=%s 等待=%.0fms",
+                                            generation.conversation_id, generation.body.request_id,
+                                            (perf_counter() - self.started_at) * 1000)
+                            self.reply += message.text
+                            yield sse_event("delta", {"request_id": request_id, "text": message.text})
+                    continue
+
+                model_result = data.get("model")
+                if model_result:
+                    response = model_result["messages"][-1]
+                    if response.tool_calls:
+                        # 模型可能先说“我来查一下”再提出工具调用，这部分不是最终答案。
+                        if self.reply:
+                            self.reply = ""
+                            yield sse_event("answer_reset", {"request_id": request_id})
+                        for call in response.tool_calls:
+                            query = str(call["args"].get("query", ""))[:400]
+                            calls[call["id"]] = query
+                            yield sse_event("tool_start", {"request_id": request_id,
+                                "call_id": call["id"], "tool": call["name"], "query": query})
+                    else:
+                        # 模型节点会在最终正文后追加真实来源；只补发尚未流式输出的部分。
+                        text = response.text
+                        if text.startswith(self.reply):
+                            remaining = text[len(self.reply):]
+                        else:
+                            remaining = text
+                            yield sse_event("answer_reset", {"request_id": request_id})
+                        self.reply = text
+                        final_received = True
+                        if remaining:
+                            yield sse_event("delta", {"request_id": request_id, "text": remaining})
+
+                tools_result = data.get("tools")
+                if tools_result:
+                    for message in tools_result["messages"]:
+                        if not isinstance(message, ToolMessage):
+                            continue
+                        artifact = message.artifact if isinstance(message.artifact, dict) else {}
+                        error = artifact.get("error")
+                        if message.status == "error":
+                            error = "搜索工具调用失败，请检查查询参数后重试"
+                        yield sse_event("tool_end", {"request_id": request_id,
+                            "call_id": message.tool_call_id, "tool": message.name,
+                            "query": calls.get(message.tool_call_id, ""),
+                            "status": "error" if error else "completed", "error": error,
+                            "sources": [{"title": item["title"], "url": item["url"]}
+                                        for item in artifact.get("sources", [])]})
+        if not final_received:
+            raise ModelError("模型未生成最终回答，请重试")
+
     async def model_events(self):
         """读取真实模型片段；等待时发送心跳，结束时关闭图迭代器。"""
         generation = self.generation
-        # *history 展开已有消息，再追加本次问题；messages 模式让图逐段返回模型消息。
-        iterator = self.agent.astream({
-            "messages": [*generation.history, ("user", generation.body.message)],
-        }, stream_mode="messages")
+        iterator = self.graph_events()
         next_chunk = None
-        # 片段一边发送一边在内存中累积，模型正常结束后再一次性保存完整回答。
-        parts = []
         try:
             # 这是生成阶段的总时限；心跳只能保持连接活跃，不能延长这个时限。
             async with asyncio.timeout(generation.duration):
@@ -117,18 +195,11 @@ class ConversationStreamResponse(StreamingResponse):
                         yield ": ping\n\n"
                     try:
                         # 任务完成后取结果；模型调用失败时，result() 也会重新抛出对应异常。
-                        message, metadata = next_chunk.result()
+                        event = next_chunk.result()
                     except StopAsyncIteration:
                         # 异步迭代器没有更多数据，说明图已经执行结束。
                         break
-                    # metadata 标明片段来源；这里只把模型节点的消息片段作为回答展示。
-                    if metadata.get("langgraph_node") != "model" or not isinstance(message, AIMessageChunk):
-                        continue
-                    text = message.text
-                    if text:
-                        parts.append(text)
-                        # yield 把本次新增文字交给外层发送，不等待完整回答，也不重复发送累计全文。
-                        yield sse_event("delta", {"request_id": str(generation.body.request_id), "text": text})
+                    yield event
         finally:
             with anyio.CancelScope(shield=True):
                 if next_chunk:
@@ -140,7 +211,7 @@ class ConversationStreamResponse(StreamingResponse):
                 await iterator.aclose()
 
         # 保存期间也保持心跳；断开时取消保存任务，让未提交的事务回滚。
-        save_task = asyncio.create_task(self.save_reply("".join(parts)))
+        save_task = asyncio.create_task(self.save_reply(self.reply))
         try:
             # 保存也可能需要等待，沿用同样的心跳机制；任务失败时由 result() 抛出异常。
             while not (await asyncio.wait({save_task}, timeout=self.heartbeat_seconds))[0]:
@@ -182,13 +253,24 @@ class ConversationStreamResponse(StreamingResponse):
         # 流已开始后不能再修改 HTTP 状态，通过 error 事件通知前端。
         # 取消异常会继续向外传播并进入 finally 清理，不会作为模型错误发送。
         except TimeoutError:
+            self.failed = True
+            logger.warning("流式回答超时 会话=%s 消息请求=%s", self.generation.conversation_id, request_id)
             yield sse_event("error", {"request_id": request_id, "code": "timeout", "message": "回答超时，请重试"})
         except ModelError as exc:
+            self.failed = True
+            logger.warning("流式回答模型错误 会话=%s 消息请求=%s 原因=%s",
+                           self.generation.conversation_id, request_id, exc)
             yield sse_event("error", {"request_id": request_id, "code": "model_error", "message": str(exc)})
         except SQLAlchemyError:
+            self.failed = True
+            logger.error("流式回答保存失败 会话=%s 消息请求=%s",
+                         self.generation.conversation_id, request_id, exc_info=True)
             yield sse_event("error", {"request_id": request_id, "code": "save_error", "message": "回答保存失败，请重试"})
         except HTTPException:
+            self.failed = True
+            logger.warning("流式回答请求已过期 会话=%s 消息请求=%s", self.generation.conversation_id, request_id)
             yield sse_event("error", {"request_id": request_id, "code": "request_expired", "message": "本次请求已过期，请重新打开会话"})
         except Exception:
-            logger.exception("流式生成异常")
+            self.failed = True
+            logger.exception("流式生成异常 会话=%s 消息请求=%s", self.generation.conversation_id, request_id)
             yield sse_event("error", {"request_id": request_id, "code": "model_error", "message": "生成失败，请重试"})

@@ -2,7 +2,7 @@
 
 一个使用 Python 构建的个人 Agent 项目。
 
-当前提供本地个人资料、MySQL 会话保存和多轮模型对话：
+当前提供本地个人资料、MySQL 会话保存、多轮流式对话和可选的联网搜索：
 
 ```text
 FastAPI → LangGraph 对话图 → LangChain 模型客户端 → 阿里百炼
@@ -44,6 +44,21 @@ curl http://127.0.0.1:8000/models/default
 
 开发环境启用了 React StrictMode。首次加载与刷新时，个人资料、默认模型和会话列表各读取一次，初始化逻辑避免了 StrictMode 检查导致的重复请求。连接失败时可在页面手动重试；HTTP 4xx/5xx 或连接失败需要结合响应和终端日志检查。
 
+## 后端日志
+
+后端使用 Python 自带的 `logging`，中文日志直接输出到启动后端的终端。默认 `INFO`，需要查看缓存复用等细节时，在 `.env` 添加 `LOG_LEVEL=DEBUG`，修改后重启后端。
+
+日志覆盖应用启动和关闭、请求状态与完整耗时、会话创建和修改、生成准备、模型调用、网页搜索、回答保存、重复请求重放，以及超时、取消和异常。流式回答还记录首次收到模型文本的等待时间；请求总耗时包含整个流式响应及清理过程，不只是返回响应头的时间。
+
+```text
+2026-10-30 15:00:00 | INFO | app.agent.graph | 请求=… | 模型调用开始 模型=qwen-plus 消息数=1 已用工具轮数=0
+2026-10-30 15:00:01 | INFO | app.tools.web_search | 请求=… | 网页搜索完成 服务=DdgsSearch 结果数=5 耗时=620ms
+```
+
+同一次 HTTP 请求的日志带相同的“请求”编号，响应头 `X-Request-ID` 返回此编号。日志中的“消息请求”是发送消息时使用的 `request_id`，重试会复用；两个编号用途不同。排查慢请求时，对照模型、搜索、准备和保存的耗时即可定位。
+
+应用日志不打印密钥、密码、请求头、查询参数、问题正文、回答正文或搜索原文。异常记录类型和代码位置，省略可能夹带 SQL 参数或上游敏感数据的原始异常正文。Uvicorn 自身仍会输出服务启动和访问日志；应用日志暂不写文件，不增加日志依赖。
+
 ## 当前进度
 
 先完成以下内容：
@@ -53,8 +68,10 @@ curl http://127.0.0.1:8000/models/default
 3. 提供 `/chat` 单轮对话接口，由 LangGraph 执行流程
 4. 提供 React 聊天页面，支持 MySQL 会话记录、Markdown、代码复制和深浅主题
 5. 设置和编辑个人昵称，保存会话并按当前会话携带历史上下文
+6. 流式展示模型回答，支持停止、重试和刷新恢复当前会话
+7. 模型按需调用联网搜索，回答附上真实搜索来源；搜索服务通过适配器替换
 
-MySQL 已用于保存个人资料、会话和消息。Milvus 尚未连接，工具和检索按后续需求增加。当前没有账号密码登录，只适合本机个人使用；同一服务的浏览器访问者共享一份个人资料。
+MySQL 已用于保存个人资料、会话和消息。Milvus 尚未连接，检索按后续需求增加。当前没有账号密码登录，只适合本机个人使用；同一服务的浏览器访问者共享一份个人资料。
 
 ## 环境准备
 
@@ -131,9 +148,41 @@ LLM_MODEL=qwen-plus
 
 `OpenAI 兼容协议` 是请求格式，使用百炼地址时请求发往百炼。模型客户端由 `langchain-openai` 提供，项目不自行拼装模型 HTTP 请求。接入其他原生协议时，在 `app/llm/factory.py` 中创建对应的 LangChain 模型客户端。
 
-当前 LangGraph 流程为 `START → model → END`。`MessagesState` 保存本次调用的消息，模型节点通过 `ainvoke` 生成回答。图本身不保存跨请求状态；会话接口从 MySQL 读取最近 20 轮、最多约 6 万字符的历史，再交给图。不同会话的上下文互不混用。原 `/chat` 仍是单轮调试接口，不保存历史。工具节点、检索节点和条件分支后续按需增加。
+当前 LangGraph 流程为 `START → model`。模型需要搜索时进入 `tools → model`，直接给出答案时结束。`MessagesState` 保存本次调用的消息，模型节点通过 `ainvoke` 生成回答。图本身不保存跨请求状态；会话接口从 MySQL 读取最近 20 轮、最多约 6 万字符的历史，再交给图。不同会话的上下文互不混用。原 `/chat` 仍是单轮调试接口，不保存历史。
 
 在 IDEA 中打开 `tests/test_chat.py`，点击测试类或方法左侧的绿色三角即可运行。测试使用模拟服务，不会调用百炼。
+
+## 联网搜索
+
+默认使用 [DDGS](https://github.com/deedy5/ddgs)，无需搜索 API Key 或额外部署服务。在现有 Conda 环境中安装依赖，根目录 `.env` 选择 `ddgs`：
+
+```bash
+conda activate cq-agent-assist
+python -m pip install -r requirements.txt
+```
+
+```env
+SEARCH_PROVIDER=ddgs
+```
+
+修改配置后重启后端即可。DDGS 在可取消的工作进程中执行同步搜索，等待期间不阻塞聊天接口；点击停止或搜索超时时会终止本次搜索。搜索源的网络等待上限为 10 秒，整次检索最多等待 15 秒。若网络不可达、搜索源限流或没有结果，页面会如实显示；不会自动使用 Tavily。
+
+需要切回 Tavily 时，在 [Tavily 控制台](https://app.tavily.com/) 获取搜索 Key，并修改 `.env`：
+
+```env
+SEARCH_PROVIDER=tavily
+TAVILY_API_KEY=你的搜索密钥
+```
+
+Tavily 的搜索 Key 与百炼模型 Key 是两份不同的配置；选择 Tavily 但未填写搜索 Key 时，普通聊天仍可使用，模型会收到“当前无法联网”的说明。DDGS 不读取这个 Key。
+
+例如提问“搜索最近的 AI 新闻，并给出来源”，模型会调用统一的 `web_search` 工具，页面展示搜索状态，最后的回答附上真实来源链接。搜索失败会给出提示，同一轮最多调用三轮工具；点击停止会取消搜索和后续生成。来源链接保存在回答正文中，刷新和重复请求重放都不重新搜索。
+
+`app/search/base.py` 定义统一接口和结果校验，`ddgs.py`、`tavily.py` 分别处理对应服务，`factory.py` 按 `SEARCH_PROVIDER` 选择。当前支持 `ddgs` 和 `tavily`，修改配置、重启后即可切换。后续接入另一家服务时，实现相同的 `search(query)` 接口并在工厂注册；LangGraph、`web_search` 和前端均不需要修改。未接入的名称会明确报错。
+
+工具在 `app/tools/web_search.py` 中使用 `from langchain_core.tools import tool` 和 `@tool(...)` 定义。`parse_docstring=True` 从函数文档的 `Args:` 中提取中文参数说明，参数结构由函数签名自动生成；`query` 使用 `Annotated` 附加去除首尾空格和 1～400 字符的校验规则。模型只提供 `query`；后台通过图的运行配置传入实际搜索服务，工具用 `get_config()` 读取。`content_and_artifact` 让模型阅读文本结果，同时让页面和来源列表读取结构化结果。
+
+在 IDEA 中可直接运行 `tests/test_ddgs.py` 和 `tests/test_web_search.py`。默认测试使用模拟模型和搜索源，并验证工作进程的停止与超时；设置 `CQ_TEST_MYSQL=1` 后，还会在随机临时库验证真实流式链路、来源保存、重复请求及搜索中的停止操作。
 
 ## 前端页面
 
@@ -178,6 +227,8 @@ app/
 ├── schemas/               # 接口数据结构和校验
 ├── agent/                 # LangGraph 编排
 ├── llm/                   # 模型服务
+├── search/                # 统一搜索接口、服务选择和搜索服务适配器
+├── tools/                 # 模型可调用的工具，当前提供 web_search
 ├── core/                  # 基础配置和通用协议
 ├── db/                    # MySQL 连接和表模型
 ├── services/              # 个人资料、会话等业务逻辑
@@ -211,9 +262,9 @@ frontend/
 - `POST /conversations`：发送 `{"first_message": "首次问题"}` 创建会话，后端立即保存问题前 28 个字符作为标题；不调用模型，模型失败后标题仍保留。前端直接使用返回的标题，发送消息接口不再修改标题。
 - `GET /conversations/{id}`、`DELETE /conversations/{id}`：详情或删除。
 - `POST /conversations/{id}/messages`：使用会话绑定的模型发送 `{"message": "你好", "request_id": "本轮UUID"}`；返回保存后的完整会话。重试使用相同请求编号。
-- `POST /conversations/{id}/messages/stream`：前端发送与重试使用此接口，请求同上；返回 `delta` 文字片段、`done` 已保存问答或 `error` 事件。浏览器请求路径加 `/api` 前缀。
+- `POST /conversations/{id}/messages/stream`：前端发送与重试使用此接口，请求同上；返回 `delta` 文字片段、`done` 已保存问答或 `error` 事件。工具调用时增加 `tool_start`、`tool_end`；`answer_reset` 清除模型调用工具前的过渡文字。浏览器请求路径加 `/api` 前缀。
 
-方案见 [002-个人资料与会话管理需求-2026-10-30.md](doc/002-个人资料与会话管理需求-2026-10-30.md) 和 [003-流式回答需求-2026-10-30.md](doc/003-流式回答需求-2026-10-30.md)。
+方案见 [002-个人资料与会话管理需求-2026-10-30.md](doc/002-个人资料与会话管理需求-2026-10-30.md)、[003-流式回答需求-2026-10-30.md](doc/003-流式回答需求-2026-10-30.md) 和 [004-联网搜索工具接入需求-2026-10-30.md](doc/004-联网搜索工具接入需求-2026-10-30.md)。
 
 普通测试不依赖 MySQL，也不调用真实模型：
 

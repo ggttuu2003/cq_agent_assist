@@ -1,6 +1,7 @@
 """应用配置，只读取当前阶段真正需要的环境变量。"""
 
 from functools import lru_cache
+from typing import Literal
 
 from pydantic import SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -15,12 +16,17 @@ class Settings(BaseSettings):
     app_env: str = "dev"
     api_host: str = "127.0.0.1"
     api_port: int = 8000
+    log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
 
     # 模型地址、密钥和名称由 .env 提供，切换兼容服务时修改这些配置。
     llm_base_url: str = ""
     llm_api_key: SecretStr = SecretStr("")
     llm_model: str = ""
     llm_timeout: float = 60
+
+    # DDGS 不需要搜索 Key；选择 Tavily 时才读取 tavily_api_key。
+    search_provider: str = "ddgs"
+    tavily_api_key: SecretStr = SecretStr("")
 
     mysql_host: str = "127.0.0.1"
     mysql_port: int = 3306

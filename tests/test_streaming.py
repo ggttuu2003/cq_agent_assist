@@ -9,7 +9,7 @@ from unittest.mock import patch
 from uuid import uuid4
 
 import httpx
-from langchain_core.messages import AIMessageChunk
+from langchain_core.messages import AIMessage, AIMessageChunk
 from pydantic import SecretStr
 from sqlalchemy.exc import SQLAlchemyError
 
@@ -46,17 +46,20 @@ class StreamingAgent:
         self.failure = False
 
     async def astream(self, state, *, stream_mode):
+        if stream_mode != ["messages", "updates"]:
+            raise AssertionError("流式回答需要同时读取消息片段和节点结果")
         self.calls.append(state["messages"])
         self.started.set()
         try:
             if self.allow_first:
                 await self.allow_first.wait()
-            yield AIMessageChunk(content="你好😀"), {"langgraph_node": "model"}
+            yield "messages", (AIMessageChunk(content="你好😀"), {"langgraph_node": "model"})
             if self.allow_rest:
                 await self.allow_rest.wait()
             if self.failure:
                 raise ModelError("模拟模型失败")
-            yield AIMessageChunk(content="，这是流式回答。"), {"langgraph_node": "model"}
+            yield "messages", (AIMessageChunk(content="，这是流式回答。"), {"langgraph_node": "model"})
+            yield "updates", {"model": {"messages": [AIMessage(content="你好😀，这是流式回答。")]}}
         finally:
             self.closed.set()
 

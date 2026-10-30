@@ -1,5 +1,14 @@
 /** 本地个人资料只含昵称，不代表已登录用户。 */
 export type User = { id: number; display_name: string };
+export type ToolCall = {
+  id: string;
+  tool: string;
+  query: string;
+  status: 'running' | 'completed' | 'error' | 'cancelled';
+  sources: { title: string; url: string }[];
+  error?: string | null;
+};
+export type StreamProgress = { type: 'answer_reset' } | { type: 'tool'; call: ToolCall };
 export type Message = {
   id: string;
   role: 'user' | 'assistant';
@@ -8,6 +17,7 @@ export type Message = {
   model?: string | null;
   status?: 'pending' | 'error' | 'cancelled';
   notice?: string;
+  toolCalls?: ToolCall[];
 };
 export type Conversation = {
   id: string;
@@ -100,15 +110,34 @@ export async function renameConversation(id: string, title: string): Promise<Con
 
 /** 解析一个完整 SSE 事件；注释是心跳，文字片段立即交给聊天页面。 */
 function readStreamEvent(block: string, id: string, requestId: string,
-  onDelta: (text: string) => void): ConversationTurn | undefined {
+  onDelta: (text: string) => void, onProgress?: (event: StreamProgress) => void): ConversationTurn | undefined {
   const lines = block.split(/\r?\n/);
   const event = lines.find((line) => line.startsWith('event:'))?.slice(6).trim();
   const payload = lines.filter((line) => line.startsWith('data:'))
     .map((line) => line.slice(5).replace(/^ /, '')).join('\n');
-  if (!payload || !['delta', 'done', 'error'].includes(event ?? '')) return;
+  if (!payload || !['delta', 'done', 'error', 'answer_reset', 'tool_start', 'tool_end'].includes(event ?? '')) return;
   const data = JSON.parse(payload);
   if (data.request_id !== requestId) throw new Error('回答请求编号不匹配，请重新打开会话。');
   if (event === 'error') throw new Error(typeof data.message === 'string' ? data.message : '生成失败，请重试。');
+  if (event === 'answer_reset') {
+    onProgress?.({ type: 'answer_reset' });
+    return;
+  }
+  if (event === 'tool_start' || event === 'tool_end') {
+    if (typeof data.call_id !== 'string' || typeof data.tool !== 'string' || typeof data.query !== 'string') {
+      throw new Error('工具调用数据格式不正确，请重试。');
+    }
+    if (event === 'tool_end' && (!['completed', 'error'].includes(data.status) || !Array.isArray(data.sources) ||
+      data.sources.some((source: { title: string; url: string }) => !source ||
+        typeof source.title !== 'string' || typeof source.url !== 'string' || !/^https?:\/\//i.test(source.url)) ||
+      (data.error != null && typeof data.error !== 'string'))) {
+      throw new Error('工具执行结果格式不正确，请重试。');
+    }
+    onProgress?.({ type: 'tool', call: { id: data.call_id, tool: data.tool, query: data.query,
+      status: event === 'tool_start' ? 'running' : data.status,
+      sources: event === 'tool_start' ? [] : data.sources, error: data.error } });
+    return;
+  }
   if (event === 'delta') {
     if (typeof data.text !== 'string') throw new Error('回答片段格式不正确，请重试。');
     onDelta(data.text);
@@ -130,7 +159,8 @@ function readStreamEvent(block: string, id: string, requestId: string,
 
 /** 用 POST 读取流，缓冲跨网络分块的事件和 UTF-8 字符，只在收到 done 后完成。 */
 export async function streamMessage(id: string, message: string, requestId: string,
-  signal: AbortSignal, onDelta: (text: string) => void): Promise<ConversationTurn> {
+  signal: AbortSignal, onDelta: (text: string) => void,
+  onProgress?: (event: StreamProgress) => void): Promise<ConversationTurn> {
   const response = await fetch(`/api/conversations/${id}/messages/stream`, {
     method: 'POST', credentials: 'same-origin', cache: 'no-store', signal,
     headers: { 'Content-Type': 'application/json', Accept: 'text/event-stream' },
@@ -155,7 +185,7 @@ export async function streamMessage(id: string, message: string, requestId: stri
         const index = boundary.index!;
         const block = buffer.slice(0, index);
         buffer = buffer.slice(index + boundary[0].length);
-        const result = readStreamEvent(block, id, requestId, onDelta);
+        const result = readStreamEvent(block, id, requestId, onDelta, onProgress);
         if (result) return result;
       }
       if (done) throw new Error('连接已中断，正在核对回答是否保存。');

@@ -458,6 +458,20 @@ kbd {
   font-size: 14px;
 }
 
+/* 搜索过程作为回答内的一行状态展示，来源链接随最终正文保存。 */
+.tool-progress {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  margin: 0 0 14px;
+  color: var(--muted);
+  font-size: 12px;
+}
+.tool-progress > :not(.tool-query) { flex-shrink: 0; }
+.tool-query { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tool-error { flex-wrap: wrap; }
+
 /* 欢迎页在内容区域中居中；输入框直接参与布局，避免不同屏幕下重叠。 */
 .welcome-hero {
   width: min(720px, calc(100% - 88px));

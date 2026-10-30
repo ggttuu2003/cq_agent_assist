@@ -1,12 +1,15 @@
 """个人资料的默认创建和修改逻辑。"""
 
 import secrets
+import logging
 
 from sqlalchemy.dialects.mysql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import User
 from app.schemas.profile import ProfileInfo
+
+logger = logging.getLogger(__name__)
 
 
 def default_display_name() -> str:
@@ -25,6 +28,7 @@ async def get_or_create_profile(db: AsyncSession) -> User:
     statement = statement.on_duplicate_key_update(id=User.id)
     await db.execute(statement)
     await db.commit()
+    logger.info("本地个人资料初始化完成 用户=1")
     return await db.get(User, 1)
 
 
@@ -33,6 +37,7 @@ async def update_profile(db: AsyncSession, display_name: str) -> User:
     user = await get_or_create_profile(db)
     user.display_name = display_name
     await db.commit()
+    logger.info("个人昵称修改成功 用户=%s", user.id)
     return user
 
 

@@ -1,8 +1,10 @@
 """负责会话归属、上下文、重复请求和问答持久化。"""
 
 import asyncio
+import logging
 from dataclasses import dataclass, field
 from datetime import timedelta, timezone
+from time import perf_counter
 from uuid import uuid4
 
 from fastapi import HTTPException
@@ -13,6 +15,8 @@ from sqlalchemy.orm import selectinload
 from app.db.models import Conversation, Message, utc_now
 from app.llm.errors import ModelError
 from app.schemas.conversations import ConversationInfo, ConversationTurnInfo, MessageInfo, SendMessageRequest
+
+logger = logging.getLogger(__name__)
 
 
 def conversation_info(conversation: Conversation) -> ConversationInfo:
@@ -44,6 +48,7 @@ async def create_user_conversation(db: AsyncSession, user_id: int, model_name: s
                                 title=first_message[:28])
     db.add(conversation)
     await db.commit()
+    logger.info("会话创建成功 会话=%s 用户=%s 模型=%s", conversation.id, user_id, model_name)
     return await get_user_conversation(db, user_id, conversation.id)
 
 
@@ -51,6 +56,7 @@ async def delete_user_conversation(db: AsyncSession, conversation_id: str) -> No
     """删除会话，消息通过外键级联删除。"""
     await db.execute(delete(Conversation).where(Conversation.id == conversation_id))
     await db.commit()
+    logger.info("会话删除成功 会话=%s", conversation_id)
 
 
 async def rename_user_conversation(db: AsyncSession, user_id: int, conversation_id: str,
@@ -63,6 +69,7 @@ async def rename_user_conversation(db: AsyncSession, user_id: int, conversation_
     conversation.title = title
     conversation.updated_at = utc_now()
     await db.commit()
+    logger.info("会话标题修改成功 会话=%s 用户=%s", conversation_id, user_id)
     return await get_user_conversation(db, user_id, conversation_id)
 
 
@@ -109,6 +116,7 @@ async def release_generation(db: AsyncSession, user_id: int, conversation_id: st
     if conversation and conversation.active_request == lease:
         conversation.active_request = None
         conversation.busy_until = None
+        logger.debug("释放本次生成占用 会话=%s", conversation_id)
     await db.commit()
 
 
@@ -143,6 +151,7 @@ async def prepare_generation(db: AsyncSession, user_id: int, conversation_id: st
     同一会话同时只允许生成一轮新回答；已完成的重复请求直接返回保存结果。
     数据库行锁只用于这段准备过程，提交事务后释放，不一直锁到模型回答结束。
     """
+    started = perf_counter()
     generation = Generation(user_id, conversation_id, body, max(10, timeout * 3))
     request_id = str(body.request_id)
     # 依赖查询可能已经开启事务，先结束它，再用行锁读取最新状态。
@@ -154,11 +163,14 @@ async def prepare_generation(db: AsyncSession, user_id: int, conversation_id: st
     ).order_by(Message.sequence))).all())
     if previous:
         if previous[0].content != body.message:
+            logger.warning("消息编号被用于不同问题 会话=%s 消息请求=%s", conversation_id, request_id)
             raise HTTPException(409, "同一个请求编号不能用于不同的问题")
         generation.saved = turn_info(conversation, request_id, previous)
         await db.commit()
+        logger.info("重放已保存的问答 会话=%s 消息请求=%s", conversation_id, request_id)
         return generation
     if conversation.busy_until and conversation.busy_until > utc_now():
+        logger.warning("会话正忙，拒绝重复生成 会话=%s 消息请求=%s", conversation_id, request_id)
         raise HTTPException(409, "这段会话正在回答，请稍候再试")
     # 给本次执行生成一个内部编号，再把“谁在回答、最晚占用到何时”写入会话表。
     # 后续请求看到尚未到期的标记，就不能在同一会话里同时开始另一轮回答。
@@ -172,15 +184,20 @@ async def prepare_generation(db: AsyncSession, user_id: int, conversation_id: st
     generation.history = model_history(history_rows)
     generation.sequence = history_rows[-1].sequence if history_rows else 0
     await db.commit()
+    logger.info("生成准备完成 会话=%s 消息请求=%s 模型=%s 历史消息数=%s 耗时=%.0fms", conversation_id,
+                request_id, generation.model_name, len(generation.history), (perf_counter() - started) * 1000)
     return generation
 
 
 async def save_generation(db: AsyncSession, generation: Generation, reply: str) -> ConversationTurnInfo:
     """核对本次占用后原子保存整轮问答，提交成功才返回完成结果。"""
+    started = perf_counter()
     if not reply.strip():
         raise ModelError("模型返回了空回答，请重试")
     conversation = await owned_conversation(db, generation.user_id, generation.conversation_id, lock=True)
     if conversation.active_request != generation.lease:
+        logger.warning("保存回答时生成占用已失效 会话=%s 消息请求=%s",
+                       generation.conversation_id, generation.body.request_id)
         raise HTTPException(409, "本次请求已过期，请重新打开会话")
     conversation.updated_at = utc_now()
     conversation.active_request = None
@@ -195,6 +212,8 @@ async def save_generation(db: AsyncSession, generation: Generation, reply: str) 
     db.add_all(messages)
     result = turn_info(conversation, request_id, messages)
     await db.commit()
+    logger.info("问答保存成功 会话=%s 消息请求=%s 回答字符数=%s 耗时=%.0fms", generation.conversation_id,
+                request_id, len(reply), (perf_counter() - started) * 1000)
     return result
 
 
@@ -207,7 +226,15 @@ async def answer_message(db: AsyncSession, user_id: int, conversation_id: str,
             async with asyncio.timeout(generation.duration):
                 result = await agent.ainvoke({"messages": [*generation.history, ("user", body.message)]})
             await save_generation(db, generation, result["messages"][-1].text)
-        except BaseException:
+        except BaseException as exc:
+            if isinstance(exc, asyncio.CancelledError):
+                logger.info("普通回答取消 会话=%s 消息请求=%s", conversation_id, body.request_id)
+            elif isinstance(exc, (ModelError, TimeoutError)):
+                logger.warning("普通回答失败 会话=%s 消息请求=%s 异常类型=%s",
+                               conversation_id, body.request_id, type(exc).__name__)
+            else:
+                logger.error("普通回答发生异常 会话=%s 消息请求=%s",
+                             conversation_id, body.request_id, exc_info=True)
             await release_generation(db, user_id, conversation_id, generation.lease)
             raise
     return conversation_info(await owned_conversation(db, user_id, conversation_id))
