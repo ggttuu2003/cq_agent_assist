@@ -2,16 +2,22 @@
 
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from langgraph.graph.state import CompiledStateGraph
 
-from app.api.dependencies import get_agent
+from app.dependencies import get_agent
 from app.llm.errors import ModelError
-from app.schemas.chat import ChatRequest, ChatResponse
+from app.schemas.chat import ChatModelInfo, ChatRequest, ChatResponse
 
 
 # 收集本模块的接口，最后由 main.py 注册到 FastAPI 应用。
 router = APIRouter()
+
+
+@router.get("/models/default", response_model=ChatModelInfo)
+async def get_chat_model_info(request: Request) -> ChatModelInfo:
+    """返回新会话的默认模型，已有会话从自己的详情读取模型名。"""
+    return ChatModelInfo(model=request.app.state.settings.llm_model.strip())
 
 
 @router.post("/chat", response_model=ChatResponse)

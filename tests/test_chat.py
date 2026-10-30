@@ -10,7 +10,7 @@ from langchain_core.messages import AIMessage
 
 from app.agent.graph import build_agent
 from app.api.chat import router
-from app.api.dependencies import get_agent
+from app.dependencies import get_agent
 from app.core.settings import Settings
 from app.llm.errors import ModelError
 from app.llm.factory import create_chat_model
@@ -112,7 +112,25 @@ class TestChatEndpoint(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.app = FastAPI()
         self.app.include_router(router)
-        self.app.state.agent = None
+        self.app.state.agents = {}
+
+    async def test_current_model_info(self):
+        """模型名来自配置；未配置时返回空值，不需要连接模型，也不返回密钥。"""
+        for model_name in ["qwen-plus", "other-model", ""]:
+            with self.subTest(model=model_name):
+                self.app.state.settings = Settings(
+                    _env_file=None,
+                    llm_model=model_name,
+                    llm_api_key="private-test-key",
+                    mysql_password="private-test-password",
+                )
+                async with httpx.AsyncClient(
+                    transport=httpx.ASGITransport(app=self.app), base_url="http://test"
+                ) as client:
+                    response = await client.get("/models/default")
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.json(), {"model": model_name})
+                self.assertEqual(self.app.state.agents, {})
 
     async def test_chat_and_empty_message(self):
         """请求经过真实 LangGraph；空白消息不会执行图。"""

@@ -1,6 +1,6 @@
 import { StrictMode } from 'react';
 import { createRoot } from 'react-dom/client';
-import App from './App';
+import App from './Profile';
 import './styles.css';
 
 // StrictMode 帮助在开发时发现副作用；实际发送请求只发生在用户操作后。

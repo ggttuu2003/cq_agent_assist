@@ -22,3 +22,9 @@ class ChatResponse(BaseModel):
     """响应数据结构：将模型回答序列化为包含 reply 字段的 JSON。"""
 
     reply: str
+
+
+class ChatModelInfo(BaseModel):
+    """新会话的默认模型信息。"""
+
+    model: str

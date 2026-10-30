@@ -15,7 +15,10 @@ import {
   ArrowUpRight,
   Check,
   Copy,
+  Cpu,
+  Pencil,
   MessageSquare,
+  UserRound,
   Moon,
   PanelLeftClose,
   PanelLeftOpen,
@@ -27,26 +30,11 @@ import {
   Trash2,
   X,
 } from 'lucide-react';
-import { sendMessage } from './api';
+import { createConversation, getConversation, getDefaultModel, listConversations, removeConversation, renameConversation, sendMessage, type Conversation, type Message, type User } from './api';
 
 // Markdown 和代码高亮体积较大，首次出现回答时再加载，欢迎页可以更快显示。
 const Markdown = lazy(() => import('./Markdown'));
 
-type Message = {
-  id: string;
-  role: 'user' | 'assistant';
-  content: string;
-  status?: 'pending' | 'error' | 'cancelled';
-};
-
-type Conversation = {
-  id: string;
-  title: string;
-  updatedAt: number;
-  messages: Message[];
-};
-
-const STORAGE_KEY = 'cq-assist.conversations.v1';
 const SIDEBAR_WIDTH_KEY = 'cq-assist.sidebar-width';
 const SIDEBAR_MIN_WIDTH = 220;
 const SIDEBAR_DEFAULT_WIDTH = 256;
@@ -64,48 +52,12 @@ function loadSidebarWidth(): number {
   }
 }
 
-/** 恢复本机历史；中断的请求恢复为可重试状态，不让页面一直显示等待。 */
-function loadConversations(): Conversation[] {
-  try {
-    const stored: unknown = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? '[]');
-    if (!Array.isArray(stored)) return [];
-    return stored
-      .filter(
-        (item): item is Conversation =>
-          item &&
-          typeof item.id === 'string' &&
-          typeof item.title === 'string' &&
-          typeof item.updatedAt === 'number' &&
-          Array.isArray(item.messages) &&
-          item.messages.every(
-            (message: Message) =>
-              message &&
-              typeof message.id === 'string' &&
-              (message.role === 'user' || message.role === 'assistant') &&
-              typeof message.content === 'string' &&
-              (message.status === undefined ||
-                ['pending', 'error', 'cancelled'].includes(message.status)),
-          ),
-      )
-      .map((item) => ({
-        ...item,
-        messages: item.messages.map((message) =>
-          message.status === 'pending'
-            ? { ...message, status: 'cancelled', content: '上次回答已中断，可以重新尝试。' }
-            : message,
-        ),
-      }));
-  } catch {
-    return [];
-  }
-}
-
-/** 标识独立消息和会话，不向后端传递这些本地标识。 */
+/** 生成本轮发送编号，重试时继续使用，服务端据此避免重复保存。 */
 function createId() {
   return crypto.randomUUID();
 }
 
-/** 用自然日期给侧栏分组，历史会话仅保存在当前浏览器。 */
+/** 用自然日期给侧栏分组，历史会话由本地个人档案的数据库记录提供。 */
 function conversationGroup(timestamp: number) {
   const today = new Date();
   today.setHours(0, 0, 0, 0);
@@ -132,11 +84,24 @@ function BrandMark({ className = '' }: { className?: string }) {
   );
 }
 
-/** 聊天工作区：界面历史由浏览器保存，模型每次只收到当前问题。 */
-export default function App() {
-  const [conversations, setConversations] = useState(loadConversations);
-  const [activeId, setActiveId] = useState<string | null>(() => conversations[0]?.id ?? null);
+/** 聊天工作区：读取本地个人档案的会话，模型上下文由服务端组装。 */
+export default function ChatWorkspace({ user, profileLoading, profileError, onRetryProfile, onEditProfile }: {
+  user: User | null;
+  profileLoading: boolean;
+  profileError: string;
+  onRetryProfile: () => void;
+  onEditProfile: () => void;
+}) {
+  const [conversations, setConversations] = useState<Conversation[]>([]);
+  const [activeId, setActiveId] = useState<string | null>(null);
+  const [historyLoading, setHistoryLoading] = useState(true);
+  const [historyError, setHistoryError] = useState('');
+  const [creating, setCreating] = useState(false);
+  const [renaming, setRenaming] = useState<{ id: string; title: string; error: string } | null>(null);
+  const [savingTitle, setSavingTitle] = useState(false);
   const [draft, setDraft] = useState('');
+  const [defaultModelName, setDefaultModelName] = useState<string | null>(null);
+  const [defaultModelError, setDefaultModelError] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(() => window.innerWidth > 760);
   const [sidebarWidth, setSidebarWidth] = useState(loadSidebarWidth);
   const [viewportWidth, setViewportWidth] = useState(() => window.innerWidth);
@@ -157,7 +122,6 @@ export default function App() {
   const searchDialogRef = useRef<HTMLDialogElement>(null);
   const requestRef = useRef<AbortController | null>(null);
   const shouldFollowRef = useRef(true);
-  const storageWarningRef = useRef(false);
   const composingRef = useRef(false);
   const sidebarDragRef = useRef<{ pointerId: number; startX: number; startWidth: number } | null>(
     null,
@@ -171,6 +135,10 @@ export default function App() {
   const active = conversations.find((item) => item.id === activeId);
   const messages = active?.messages ?? [];
   const isWelcome = messages.length === 0;
+  // 打开会话时以该会话为准，默认模型接口失败也不影响已有会话的显示。
+  const displayedModel = active
+    ? active.modelName || '未配置模型'
+    : defaultModelError ? '模型信息不可用' : defaultModelName ?? '读取模型…';
   const isActivePending = pending?.conversationId === activeId;
   const filteredConversations = [...conversations]
     .sort((first, second) => second.updatedAt - first.updatedAt)
@@ -181,6 +149,22 @@ export default function App() {
           .toLocaleLowerCase()
           .includes(search.trim().toLocaleLowerCase()),
     );
+
+  useEffect(() => {
+    // 默认模型仅用于新会话，已有会话的模型来自会话列表或详情。
+    const controller = new AbortController();
+    getDefaultModel(controller.signal)
+      .then((name) => {
+        if (!controller.signal.aborted) {
+          setDefaultModelName(name || '未配置模型');
+          setDefaultModelError(false);
+        }
+      })
+      .catch(() => {
+        if (!controller.signal.aborted) setDefaultModelError(true);
+      });
+    return () => controller.abort();
+  }, [user?.id]);
 
   useEffect(() => {
     function handleWindowResize() {
@@ -204,16 +188,54 @@ export default function App() {
     }
   }, [sidebarWidth, resizingSidebar]);
 
-  useEffect(() => {
+  /** 重新读取个人档案下的全部会话，不触碰旧版匿名浏览器记录。 */
+  async function reloadConversations() {
+    setHistoryLoading(true);
+    setHistoryError('');
     try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(conversations));
+      setConversations(await listConversations());
     } catch {
-      if (!storageWarningRef.current) {
-        setToast('浏览器无法保存记录，当前对话仍可继续使用。');
-        storageWarningRef.current = true;
-      }
-    }
-  }, [conversations]);
+      setHistoryError('会话加载失败，请检查服务后重试。');
+    } finally { setHistoryLoading(false); }
+  }
+
+  useEffect(() => {
+    if (!user) return;
+    setHistoryLoading(true);
+    setHistoryError('');
+    const controller = new AbortController();
+    listConversations(controller.signal).then((items) => {
+      if (!controller.signal.aborted) setConversations(items);
+    }).catch(() => {
+      if (!controller.signal.aborted) setHistoryError('会话加载失败，请检查服务后重试。');
+    }).finally(() => {
+      if (!controller.signal.aborted) setHistoryLoading(false);
+    });
+    return () => controller.abort();
+  }, [user?.id]);
+
+  // 页面停止等待或重新打开时，继续读取服务器生成状态，恢复已经保存的回答。
+  useEffect(() => {
+    if (!active?.generating || pending?.conversationId === active.id) return;
+    const id = active.id;
+    const controller = new AbortController();
+    const timer = window.setInterval(() => {
+      getConversation(id, controller.signal).then((saved) => {
+        if (!controller.signal.aborted && !saved.generating) {
+          setConversations((items) => items.map((item) => {
+            if (item.id !== id) return item;
+            const waiting = item.messages.at(-1);
+            // 后台未保存成功时，保留页面上的原问题和重试入口。
+            if (waiting?.status && !saved.messages.some((message) => message.requestId === waiting.id)) {
+              return { ...item, generating: false };
+            }
+            return saved;
+          }));
+        }
+      }).catch(() => { /* 短暂网络失败时保留页面，下一次轮询继续恢复。 */ });
+    }, 2000);
+    return () => { controller.abort(); window.clearInterval(timer); };
+  }, [active?.id, active?.generating, pending?.conversationId]);
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
@@ -351,27 +373,32 @@ export default function App() {
     );
   }
 
-  /** 每次只发送一个问题；页面中的历史消息暂不作为模型上下文。 */
+  /** 发送会话编号和请求编号；服务端负责读取历史并保存完整问答。 */
   async function requestAnswer(conversationId: string, messageId: string, question: string) {
     const controller = new AbortController();
     requestRef.current = controller;
     setPending({ conversationId, messageId });
     try {
-      const reply = await sendMessage(question, controller.signal);
+      const saved = await sendMessage(conversationId, question, messageId, controller.signal);
       if (controller.signal.aborted) return;
-      updateAnswer(conversationId, messageId, reply);
+      setConversations((items) => items.map((item) => item.id === saved.id ? saved : item));
     } catch (error) {
       if (controller.signal.aborted) {
-        updateAnswer(conversationId, messageId, '已停止等待回答，可以重新尝试。', 'cancelled');
+        updateAnswer(conversationId, messageId, '已停止等待，后台可能仍在回答。', 'cancelled');
       } else {
-        const detail =
-          error instanceof TypeError
-            ? '无法连接服务，请确认后端已启动，然后重试。'
-            : error instanceof Error
-              ? error.message
-              : '暂时无法获取回答，请重试。';
+        const detail = error instanceof TypeError ? '无法连接服务，请检查后重试。' :
+          error instanceof Error ? error.message : '暂时无法获取回答，请重试。';
         updateAnswer(conversationId, messageId, detail, 'error');
       }
+      // 响应丢失时数据库可能已经保存成功，先核对，避免让用户重复发送。
+      try {
+        const saved = await getConversation(conversationId, AbortSignal.timeout(8000));
+        setConversations((items) => items.map((item) => {
+          if (item.id !== saved.id) return item;
+          if (saved.messages.some((message) => message.requestId === messageId)) return saved;
+          return { ...item, generating: saved.generating };
+        }));
+      } catch { /* 未能确认结果时仍保留原问题和重试入口。 */ }
     } finally {
       if (requestRef.current === controller) {
         requestRef.current = null;
@@ -380,40 +407,36 @@ export default function App() {
     }
   }
 
-  /** 创建用户消息和等待占位，然后调用接口。 */
-  function submitMessage(event: FormEvent) {
+  /** 第一次发送时创建服务端会话，创建失败时保留输入内容。 */
+  async function submitMessage(event: FormEvent) {
     event.preventDefault();
     const question = draft.trim();
-    if (!question || pending || requestRef.current) return;
-    const conversationId = active?.id ?? createId();
-    const answerId = createId();
-    const additions: Message[] = [
-      { id: createId(), role: 'user', content: question },
-      { id: answerId, role: 'assistant', content: '', status: 'pending' },
-    ];
-    const now = Date.now();
-    setConversations((previous) =>
-      active
-        ? previous.map((item) =>
-            item.id === conversationId
-              ? { ...item, updatedAt: now, messages: [...item.messages, ...additions] }
-              : item,
-          )
-        : [
-            {
-              id: conversationId,
-              title: question.slice(0, 28),
-              updatedAt: now,
-              messages: additions,
-            },
-            ...previous,
-          ],
-    );
-    shouldFollowRef.current = true;
-    setActiveId(conversationId);
-    setDraft('');
-    inputRef.current?.focus();
-    void requestAnswer(conversationId, answerId, question);
+    if (!question || !user || pending || requestRef.current || historyLoading || historyError || active?.generating || (activeId && renaming?.id === activeId)) return;
+    const controller = new AbortController();
+    requestRef.current = controller;
+    setCreating(true);
+    try {
+      const conversation = active ?? await createConversation(question);
+      if (controller.signal.aborted) return;
+      const answerId = createId();
+      const additions: Message[] = [
+        { id: createId(), role: 'user', content: question },
+        { id: answerId, role: 'assistant', content: '', status: 'pending' },
+      ];
+      const updated = { ...conversation,
+        updatedAt: Date.now(), messages: [...conversation.messages, ...additions] };
+      setConversations((previous) => active ? previous.map((item) => item.id === updated.id ? updated : item) : [updated, ...previous]);
+      shouldFollowRef.current = true;
+      setActiveId(conversation.id);
+      setDraft('');
+      inputRef.current?.focus();
+      void requestAnswer(conversation.id, answerId, question);
+    } catch (error) {
+      setToast(error instanceof Error ? error.message : '无法创建会话，请重试。');
+    } finally {
+      setCreating(false);
+      if (requestRef.current === controller) requestRef.current = null;
+    }
   }
 
   /** 中文输入法选词时的回车不发送；Shift+Enter 保留换行。 */
@@ -438,24 +461,61 @@ export default function App() {
     window.requestAnimationFrame(() => inputRef.current?.focus());
   }
 
-  /** 切换本地会话，不触发模型请求。 */
-  function openConversation(id: string) {
+  /** 切换时核对服务端最新记录，不调用模型。 */
+  async function openConversation(id: string) {
     setActiveId(id);
     setDraft('');
     setSearchOpen(false);
     setSearch('');
     if (window.innerWidth <= 760) setSidebarOpen(false);
+    const local = conversations.find((item) => item.id === id);
+    if (pending?.conversationId === id || local?.messages.some((message) => message.status)) return;
+    try {
+      const saved = await getConversation(id);
+      // 读取期间如果已经发送问题或更新回答，就不能用旧快照覆盖页面。
+      setConversations((items) => items.map((item) =>
+        item.id === id && item === local ? saved : item,
+      ));
+    } catch (error) { setToast(error instanceof Error ? error.message : '无法加载会话'); }
   }
 
-  /** 删除浏览器里的指定会话；正在等待时同时取消前端请求。 */
-  function deleteConversation(id: string) {
-    if (pending?.conversationId === id) requestRef.current?.abort();
-    setConversations((previous) => previous.filter((item) => item.id !== id));
-    if (activeId === id) {
-      setActiveId(null);
-      setDraft('');
+  /** 在侧栏原位编辑标题，不切换当前正在查看的会话。 */
+  function startRename(conversation: Conversation) {
+    if (savingTitle || conversation.generating || pending?.conversationId === conversation.id) return;
+    setRenaming({ id: conversation.id, title: conversation.title, error: '' });
+  }
+
+  /** 保存成功后只更新标题和时间，保留页面上正在等待或重试的消息。 */
+  async function saveTitle(event: FormEvent) {
+    event.preventDefault();
+    if (!renaming || savingTitle) return;
+    const title = renaming.title.trim();
+    if (!title || Array.from(title).length > 120) {
+      setRenaming({ ...renaming, error: '标题需要 1–120 个字符。' });
+      return;
     }
-    setToast('已删除这段本地对话');
+    setSavingTitle(true);
+    try {
+      const saved = await renameConversation(renaming.id, title);
+      setConversations((items) => items.map((item) => item.id === saved.id
+        ? { ...item, title: saved.title, updatedAt: saved.updatedAt } : item));
+      setRenaming(null);
+      setToast('标题已修改');
+    } catch (error) {
+      setRenaming({ ...renaming, error: error instanceof Error ? error.message : '保存失败，请重试。' });
+    } finally { setSavingTitle(false); }
+  }
+
+  /** 服务端删除成功之后再移除侧栏记录。 */
+  async function deleteConversation(id: string) {
+    if (pending?.conversationId === id) { setToast('会话正在回答，请完成后再删除。'); return; }
+    if (!window.confirm('删除这段会话及全部消息？')) return;
+    try {
+      await removeConversation(id);
+      setConversations((previous) => previous.filter((item) => item.id !== id));
+      if (activeId === id) { setActiveId(null); setDraft(''); }
+      setToast('已删除这段会话');
+    } catch (error) { setToast(error instanceof Error ? error.message : '删除失败，请重试'); }
   }
 
   /** 将原始回答复制为文本，保留 Markdown 格式。 */
@@ -471,7 +531,7 @@ export default function App() {
 
   /** 使用该回答前面的用户问题重试，替换原回答而不重复追加消息。 */
   function retryMessage(messageId: string) {
-    if (!active || pending || requestRef.current) return;
+    if (!active || pending || requestRef.current || active.generating) return;
     const index = active.messages.findIndex((message) => message.id === messageId);
     const question = active.messages[index - 1];
     if (index < 1 || question?.role !== 'user') return;
@@ -516,10 +576,21 @@ export default function App() {
             composingRef.current = false;
           }}
           placeholder="输入消息……"
+          maxLength={20000}
+          disabled={creating}
           title="Enter 发送，Shift + Enter 换行"
           rows={1}
         />
         <div className="composer-toolbar">
+          <span
+            className="model-caption"
+            role="status"
+            aria-label="当前模型"
+            title={active ? `会话模型：${displayedModel}` : `新会话默认模型：${displayedModel}`}
+          >
+            <Cpu size={14} strokeWidth={1.5} aria-hidden="true" />
+            <span>{displayedModel}</span>
+          </span>
           {isActivePending ? (
             <button
               className="send-button stop-button"
@@ -534,7 +605,7 @@ export default function App() {
             <button
               className="send-button"
               type="submit"
-              disabled={!draft.trim() || !!pending}
+              disabled={!draft.trim() || !user || !!pending || creating || historyLoading || !!historyError || !!active?.generating || (!!activeId && renaming?.id === activeId) || draft.trim().length > 20000}
               aria-label="发送消息"
               title={pending ? '另一段对话正在回答，请稍候' : '发送消息'}
             >
@@ -601,7 +672,7 @@ export default function App() {
           </div>
           {conversations.length === 0 ? (
             <div className="history-empty">
-              <p>暂无对话</p>
+              <p>{!user ? '暂无对话' : historyLoading ? '正在加载…' : historyError ? '会话未加载' : '暂无对话'}</p>
             </div>
           ) : (
             ['今天', '昨天', '更早'].map((group) => {
@@ -617,25 +688,52 @@ export default function App() {
                         key={item.id}
                         className={`history-row ${item.id === activeId ? 'active' : ''}`}
                       >
+                        {renaming?.id === item.id ? (
+                          <form className="history-rename" onSubmit={saveTitle} aria-label="修改会话标题">
+                            <div className="history-rename-controls">
+                              <input autoFocus aria-label="会话标题" value={renaming.title}
+                                disabled={savingTitle} required
+                                onFocus={(event) => event.currentTarget.select()}
+                                onChange={(event) => setRenaming({ ...renaming, title: event.target.value, error: '' })}
+                                onKeyDown={(event) => {
+                                  if (event.key === 'Escape' && !savingTitle) setRenaming(null);
+                                  if (event.key === 'Enter' && event.nativeEvent.isComposing) event.preventDefault();
+                                }} />
+                              <button className="icon-button" type="submit" aria-label="保存标题"
+                                title="保存标题" disabled={savingTitle || !renaming.title.trim()}>
+                                {savingTitle ? <span className="small-spinner" /> : <Check size={14} />}
+                              </button>
+                              <button className="icon-button" type="button" aria-label="取消修改标题"
+                                title="取消" disabled={savingTitle} onClick={() => setRenaming(null)}><X size={14} /></button>
+                            </div>
+                            {renaming.error && <p className="history-rename-error" role="alert">{renaming.error}</p>}
+                          </form>
+                        ) : <>
                         <button
                           className="history-item"
                           onClick={() => openConversation(item.id)}
                           aria-current={item.id === activeId ? 'page' : undefined}
                         >
                           <MessageSquare size={14} />
-                          <span>{item.title}</span>
+                          <span title={item.title}>{item.title}</span>
                           {pending?.conversationId === item.id && (
                             <span className="small-spinner" />
                           )}
                         </button>
+                        <button className="history-action icon-button" onClick={() => startRename(item)}
+                          aria-label={`修改标题：${item.title}`} title="修改标题"
+                          disabled={savingTitle || item.generating || pending?.conversationId === item.id}>
+                          <Pencil size={14} />
+                        </button>
                         <button
-                          className="history-delete icon-button"
+                          className="history-action icon-button"
                           onClick={() => deleteConversation(item.id)}
                           aria-label={`删除对话：${item.title}`}
-                          title="删除本地对话"
+                          title="删除对话"
                         >
                           <Trash2 size={14} />
                         </button>
+                        </>}
                       </div>
                     ))}
                   </div>
@@ -646,9 +744,13 @@ export default function App() {
         </div>
         <div className="sidebar-footer">
           <div className="profile-row">
-            <span className="workspace-label" title="对话记录仅保存在当前浏览器">
-              个人空间
-            </span>
+            <span className="user-avatar" aria-hidden="true">{user ? Array.from(user.display_name)[0]?.toUpperCase() : <UserRound size={15} />}</span>
+            <div className="user-details" title={user?.display_name}>
+              <strong>{user?.display_name ?? (profileLoading ? '读取资料…' : '资料未加载')}</strong><small>个人空间</small>
+            </div>
+            <button className="icon-button" title="编辑个人资料" aria-label="编辑个人资料" onClick={onEditProfile} disabled={!user}>
+              <UserRound size={16} />
+            </button>
             <button
               className="icon-button theme-button"
               onClick={() => setTheme(theme === 'light' ? 'dark' : 'light')}
@@ -698,6 +800,9 @@ export default function App() {
           </div>
         </header>
 
+        {profileError && <div className="workspace-error" role="alert">{profileError}<button className="text-button" onClick={onRetryProfile}>重新连接</button></div>}
+        {!profileError && historyError && <div className="workspace-error" role="alert">{historyError}<button className="text-button" onClick={() => void reloadConversations()}>重试</button></div>}
+        {active?.generating && !isActivePending && <div className="workspace-error" role="status">后台正在回答，完成后会自动恢复。</div>}
         <div
           className="conversation-scroll"
           ref={scrollRef}
@@ -751,7 +856,7 @@ export default function App() {
                           <button
                             className="text-button"
                             onClick={() => retryMessage(message.id)}
-                            disabled={!!pending}
+                            disabled={!!pending || !!active?.generating}
                           >
                             <RotateCcw size={13} />
                             {message.status === 'error' ? '重试' : '重新回答'}
@@ -775,15 +880,7 @@ export default function App() {
                             >
                               {copiedId === message.id ? <Check size={15} /> : <Copy size={15} />}
                             </button>
-                            <button
-                              className="icon-button"
-                              aria-label="重新生成回答"
-                              title="重新生成回答"
-                              disabled={!!pending}
-                              onClick={() => retryMessage(message.id)}
-                            >
-                              <RotateCcw size={15} />
-                            </button>
+
                           </div>
                         </>
                       )}
@@ -805,7 +902,7 @@ export default function App() {
         onClick={(event) => {
           if (event.target === event.currentTarget) setSearchOpen(false);
         }}
-        aria-label="搜索本地对话"
+        aria-label="搜索对话"
       >
         <div className="search-dialog-input">
           <Search size={19} />
@@ -847,7 +944,7 @@ export default function App() {
           )}
         </div>
         <div className="search-dialog-footer">
-          <span>本地记录</span>
+          <span>个人会话记录</span>
           <kbd>ESC 关闭</kbd>
         </div>
       </dialog>
