@@ -60,3 +60,12 @@ class ConversationInfo(BaseModel):
     updated_at: datetime
     messages: list[MessageInfo]
     generating: bool = False
+
+
+class ConversationTurnInfo(BaseModel):
+    """流式完成结果，只包含本轮消息，避免覆盖前端的会话标题等资料。"""
+    request_id: str
+    conversation_id: str
+    updated_at: datetime
+    messages: list[MessageInfo]
+    generating: bool = False

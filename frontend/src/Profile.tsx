@@ -48,29 +48,49 @@ export default function Profile() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [editing, setEditing] = useState(false);
+  const [connectionAttempt, setConnectionAttempt] = useState(0);
+  const profileRequestRef = useRef<AbortController | null>(null);
 
-  async function initialize(signal?: AbortSignal) {
+  /** 同一时间只读取一次资料，首次加载和手动重连共用取消与状态处理。 */
+  async function initialize() {
+    if (profileRequestRef.current) return;
+    const controller = new AbortController();
+    profileRequestRef.current = controller;
+    const signal = controller.signal;
     setLoading(true);
     setError('');
     try {
       const saved = await getProfile(signal);
-      if (!signal?.aborted) setUser(saved);
+      if (!signal.aborted) setUser(saved);
     } catch {
-      if (!signal?.aborted) setError('暂时无法连接服务');
+      if (!signal.aborted) setError('暂时无法连接服务');
     } finally {
-      if (!signal?.aborted) setLoading(false);
+      if (!signal.aborted) setLoading(false);
+      if (profileRequestRef.current === controller) profileRequestRef.current = null;
     }
   }
 
+  /** 只有用户主动重连时，才让模型信息也重新读取，资料更新不会触发它。 */
+  function retryConnection() {
+    if (profileRequestRef.current) return;
+    setConnectionAttempt((attempt) => attempt + 1);
+    void initialize();
+  }
+
   useEffect(() => {
-    const controller = new AbortController();
-    void initialize(controller.signal);
-    return () => controller.abort();
+    // 下一轮事件循环再发送：StrictMode 首次检查会立即清理，先撤销尚未发出的请求。
+    const timer = window.setTimeout(() => void initialize(), 0);
+    return () => {
+      window.clearTimeout(timer);
+      // 真正离开页面时，首次加载和手动重连中尚未完成的请求都要取消。
+      profileRequestRef.current?.abort();
+      profileRequestRef.current = null;
+    };
   }, []);
 
   return <>
-    <ChatWorkspace user={user} profileLoading={loading} profileError={error}
-      onRetryProfile={() => void initialize()} onEditProfile={() => setEditing(true)} />
+    <ChatWorkspace user={user} profileLoading={loading} profileError={error} connectionAttempt={connectionAttempt}
+      onRetryProfile={retryConnection} onEditProfile={() => setEditing(true)} />
     {editing && user && <ProfileDialog user={user} onSaved={(saved) => { setUser(saved); setEditing(false); }} onClose={() => setEditing(false)} />}
   </>;
 }

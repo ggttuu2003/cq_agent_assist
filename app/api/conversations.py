@@ -19,8 +19,10 @@ from app.services.conversations import (
     delete_user_conversation,
     get_user_conversation,
     list_user_conversations,
+    prepare_generation,
     rename_user_conversation,
 )
+from app.services.streaming import ConversationStreamResponse
 
 router = APIRouter(prefix="/conversations", tags=["会话"])
 
@@ -79,3 +81,18 @@ async def send_message(conversation_id: UUID, body: SendMessageRequest, request:
         raise HTTPException(502, str(exc)) from None
     except TimeoutError:
         raise HTTPException(504, "回答超时，请稍后重试") from None
+
+
+@router.post("/{conversation_id}/messages/stream", response_class=ConversationStreamResponse, status_code=200)
+async def stream_message(conversation_id: UUID, body: SendMessageRequest, request: Request,
+                         user: CurrentUser, db: Db,
+                         agent: Annotated[CompiledStateGraph, Depends(get_conversation_agent)]):
+    """先检查会话是否存在、请求是否重复，以及该会话是否正在回答。
+
+    允许开始新的回答时，在数据库中标记“该会话正在回答”，再开始流式返回。
+    这样校验失败仍能返回正常的 HTTP 错误，而不是先返回 200 再报告错误。
+    等待模型回答期间不一直占用数据库连接。
+    """
+    generation = await prepare_generation(db, user.id, str(conversation_id), body,
+                                          request.app.state.settings.llm_timeout)
+    return ConversationStreamResponse(request.app.state.db_sessions, generation, agent)

@@ -4,6 +4,7 @@
 # Web API 服务
 fastapi>=0.115,<1.0
 uvicorn[standard]>=0.34,<1.0
+anyio>=4,<5  # 管理流式响应的并发任务和取消清理
 
 # 配置与数据校验
 pydantic>=2.10,<3.0

@@ -7,6 +7,7 @@ export type Message = {
   requestId?: string;
   model?: string | null;
   status?: 'pending' | 'error' | 'cancelled';
+  notice?: string;
 };
 export type Conversation = {
   id: string;
@@ -17,9 +18,14 @@ export type Conversation = {
   generating?: boolean;
 };
 
+type SavedMessage = { id: string; role: 'user' | 'assistant'; content: string; request_id: string; model: string | null };
 type SavedConversation = {
   id: string; title: string; model_name: string; updated_at: string; generating: boolean;
-  messages: { id: string; role: 'user' | 'assistant'; content: string; request_id: string; model: string | null }[];
+  messages: SavedMessage[];
+};
+
+export type ConversationTurn = {
+  requestId: string; conversationId: string; updatedAt: number; messages: Message[];
 };
 
 export class ApiError extends Error {
@@ -92,9 +98,70 @@ export async function renameConversation(id: string, title: string): Promise<Con
   }));
 }
 
-/** 重试时复用请求编号，服务端会返回已经保存的回答，避免重复问答。 */
-export async function sendMessage(id: string, message: string, requestId: string, signal: AbortSignal): Promise<Conversation> {
-  return toConversation(await request<SavedConversation>(`/conversations/${id}/messages`, {
-    method: 'POST', body: JSON.stringify({ message, request_id: requestId }), signal,
-  }));
+/** 解析一个完整 SSE 事件；注释是心跳，文字片段立即交给聊天页面。 */
+function readStreamEvent(block: string, id: string, requestId: string,
+  onDelta: (text: string) => void): ConversationTurn | undefined {
+  const lines = block.split(/\r?\n/);
+  const event = lines.find((line) => line.startsWith('event:'))?.slice(6).trim();
+  const payload = lines.filter((line) => line.startsWith('data:'))
+    .map((line) => line.slice(5).replace(/^ /, '')).join('\n');
+  if (!payload || !['delta', 'done', 'error'].includes(event ?? '')) return;
+  const data = JSON.parse(payload);
+  if (data.request_id !== requestId) throw new Error('回答请求编号不匹配，请重新打开会话。');
+  if (event === 'error') throw new Error(typeof data.message === 'string' ? data.message : '生成失败，请重试。');
+  if (event === 'delta') {
+    if (typeof data.text !== 'string') throw new Error('回答片段格式不正确，请重试。');
+    onDelta(data.text);
+    return;
+  }
+  if (data.conversation_id !== id || !Array.isArray(data.messages) || data.messages.length !== 2 ||
+    data.generating !== false || !Number.isFinite(Date.parse(data.updated_at)) ||
+    data.messages.some((item: SavedMessage, index: number) => !item || typeof item.id !== 'string' ||
+      typeof item.content !== 'string' || item.request_id !== requestId || item.role !== (index ? 'assistant' : 'user'))) {
+    throw new Error('回答完成数据不正确，请重新打开会话。');
+  }
+  return {
+    requestId, conversationId: id, updatedAt: Date.parse(data.updated_at),
+    messages: data.messages.map((item: SavedMessage) => ({
+      id: item.id, role: item.role, content: item.content, requestId: item.request_id, model: item.model,
+    })),
+  };
+}
+
+/** 用 POST 读取流，缓冲跨网络分块的事件和 UTF-8 字符，只在收到 done 后完成。 */
+export async function streamMessage(id: string, message: string, requestId: string,
+  signal: AbortSignal, onDelta: (text: string) => void): Promise<ConversationTurn> {
+  const response = await fetch(`/api/conversations/${id}/messages/stream`, {
+    method: 'POST', credentials: 'same-origin', cache: 'no-store', signal,
+    headers: { 'Content-Type': 'application/json', Accept: 'text/event-stream' },
+    body: JSON.stringify({ message, request_id: requestId }),
+  });
+  if (!response.ok) {
+    const data = await response.json().catch(() => null);
+    throw new ApiError(typeof data?.detail === 'string' ? data.detail : '发送失败，请重试。', response.status);
+  }
+  if (!response.body || !response.headers.get('content-type')?.includes('text/event-stream')) {
+    throw new Error('服务未返回流式回答，请检查后端版本。');
+  }
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder('utf-8', { fatal: true });
+  let buffer = '';
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      buffer += decoder.decode(value, { stream: !done });
+      let boundary: RegExpMatchArray | null;
+      while ((boundary = buffer.match(/\r?\n\r?\n/))) {
+        const index = boundary.index!;
+        const block = buffer.slice(0, index);
+        buffer = buffer.slice(index + boundary[0].length);
+        const result = readStreamEvent(block, id, requestId, onDelta);
+        if (result) return result;
+      }
+      if (done) throw new Error('连接已中断，正在核对回答是否保存。');
+    }
+  } finally {
+    await reader.cancel().catch(() => { /* 连接可能已因停止或网络故障关闭。 */ });
+    reader.releaseLock();
+  }
 }

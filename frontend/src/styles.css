@@ -449,6 +449,15 @@ kbd {
   flex-direction: column;
 }
 
+.conversation-loading {
+  min-height: 100%;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  color: var(--muted);
+  font-size: 14px;
+}
+
 /* 欢迎页在内容区域中居中；输入框直接参与布局，避免不同屏幕下重叠。 */
 .welcome-hero {
   width: min(720px, calc(100% - 88px));

@@ -1,6 +1,7 @@
 """负责会话归属、上下文、重复请求和问答持久化。"""
 
 import asyncio
+from dataclasses import dataclass, field
 from datetime import timedelta, timezone
 from uuid import uuid4
 
@@ -11,7 +12,7 @@ from sqlalchemy.orm import selectinload
 
 from app.db.models import Conversation, Message, utc_now
 from app.llm.errors import ModelError
-from app.schemas.conversations import ConversationInfo, MessageInfo, SendMessageRequest
+from app.schemas.conversations import ConversationInfo, ConversationTurnInfo, MessageInfo, SendMessageRequest
 
 
 def conversation_info(conversation: Conversation) -> ConversationInfo:
@@ -111,58 +112,102 @@ async def release_generation(db: AsyncSession, user_id: int, conversation_id: st
     await db.commit()
 
 
-async def answer_message(db: AsyncSession, user_id: int, conversation_id: str,
-                         body: SendMessageRequest, agent, timeout: float):
-    """短事务领取占用，事务外调用图，再用短事务保存完整问答。"""
+@dataclass(slots=True)
+class Generation:
+    """一次生成的占用和上下文；跨事务传递普通数据，不持有数据库连接。"""
+    user_id: int
+    conversation_id: str
+    body: SendMessageRequest
+    duration: float
+    lease: str | None = None
+    model_name: str = ""
+    history: list[tuple[str, str]] = field(default_factory=list)
+    sequence: int = 0
+    saved: ConversationTurnInfo | None = None
+
+
+def turn_info(conversation: Conversation, request_id: str, messages: list[Message]) -> ConversationTurnInfo:
+    """把本轮已保存问答转成流式完成事件的数据。"""
+    return ConversationTurnInfo(
+        request_id=request_id, conversation_id=conversation.id,
+        updated_at=conversation.updated_at.replace(tzinfo=timezone.utc),
+        messages=[MessageInfo(id=m.id, role=m.role, content=m.content, model=m.model,
+                              request_id=m.request_id) for m in messages],
+    )
+
+
+async def prepare_generation(db: AsyncSession, user_id: int, conversation_id: str,
+                             body: SendMessageRequest, timeout: float) -> Generation:
+    """检查会话和重复请求，标记本次回答正在进行，并读取历史消息。
+
+    同一会话同时只允许生成一轮新回答；已完成的重复请求直接返回保存结果。
+    数据库行锁只用于这段准备过程，提交事务后释放，不一直锁到模型回答结束。
+    """
+    generation = Generation(user_id, conversation_id, body, max(10, timeout * 3))
     request_id = str(body.request_id)
-    # 读取个人资料会开启只读事务，先结束它，保证下一次加锁读取最新会话。
+    # 依赖查询可能已经开启事务，先结束它，再用行锁读取最新状态。
     await db.commit()
     conversation = await owned_conversation(db, user_id, conversation_id, lock=True)
-    # 模型从会话读取，避免发送过程中被全局默认配置悄悄替换。
-    model_name = conversation.model_name
+    generation.model_name = conversation.model_name
     previous = list((await db.scalars(select(Message).where(
         Message.conversation_id == conversation_id, Message.request_id == request_id,
     ).order_by(Message.sequence))).all())
     if previous:
         if previous[0].content != body.message:
             raise HTTPException(409, "同一个请求编号不能用于不同的问题")
+        generation.saved = turn_info(conversation, request_id, previous)
         await db.commit()
-        return conversation_info(await owned_conversation(db, user_id, conversation_id))
+        return generation
     if conversation.busy_until and conversation.busy_until > utc_now():
         raise HTTPException(409, "这段会话正在回答，请稍候再试")
-    lease = str(uuid4())
-    conversation.active_request = lease
-    # 客户端可能重试模型请求；整次图调用也有明确的总时限。
-    duration = max(10, timeout * 3)
-    conversation.busy_until = utc_now() + timedelta(seconds=duration + 30)
+    # 给本次执行生成一个内部编号，再把“谁在回答、最晚占用到何时”写入会话表。
+    # 后续请求看到尚未到期的标记，就不能在同一会话里同时开始另一轮回答。
+    # 到期时间用于服务异常退出、来不及清理标记时，允许后续请求恢复使用会话。
+    generation.lease = str(uuid4())
+    conversation.active_request = generation.lease
+    conversation.busy_until = utc_now() + timedelta(seconds=generation.duration + 30)
     history_rows = list((await db.scalars(select(Message).where(
         Message.conversation_id == conversation_id,
     ).order_by(Message.sequence.desc()).limit(40))).all())[::-1]
-    history = model_history(history_rows)
-    sequence = history_rows[-1].sequence if history_rows else 0
+    generation.history = model_history(history_rows)
+    generation.sequence = history_rows[-1].sequence if history_rows else 0
     await db.commit()
+    return generation
 
-    try:
-        async with asyncio.timeout(duration):
-            result = await agent.ainvoke({"messages": [*history, ("user", body.message)]})
-        reply = result["messages"][-1].text
-        if not reply.strip():
-            raise ModelError("模型返回了空回答，请重试")
-        conversation = await owned_conversation(db, user_id, conversation_id, lock=True)
-        if conversation.active_request != lease:
-            raise HTTPException(409, "本次请求已过期，请重新打开会话")
-        conversation.updated_at = utc_now()
-        conversation.active_request = None
-        conversation.busy_until = None
-        db.add_all([
-            Message(id=str(uuid4()), conversation_id=conversation_id, sequence=sequence + 1,
-                    request_id=request_id, role="user", content=body.message),
-            Message(id=str(uuid4()), conversation_id=conversation_id, sequence=sequence + 2,
-                    request_id=request_id, role="assistant", content=reply, model=model_name),
-        ])
-        await db.commit()
-    except BaseException:
-        # 包括页面断开导致的任务取消；仍需撤销当前请求占用。
-        await release_generation(db, user_id, conversation_id, lease)
-        raise
+
+async def save_generation(db: AsyncSession, generation: Generation, reply: str) -> ConversationTurnInfo:
+    """核对本次占用后原子保存整轮问答，提交成功才返回完成结果。"""
+    if not reply.strip():
+        raise ModelError("模型返回了空回答，请重试")
+    conversation = await owned_conversation(db, generation.user_id, generation.conversation_id, lock=True)
+    if conversation.active_request != generation.lease:
+        raise HTTPException(409, "本次请求已过期，请重新打开会话")
+    conversation.updated_at = utc_now()
+    conversation.active_request = None
+    conversation.busy_until = None
+    request_id = str(generation.body.request_id)
+    messages = [
+        Message(id=str(uuid4()), conversation_id=generation.conversation_id, sequence=generation.sequence + 1,
+                request_id=request_id, role="user", content=generation.body.message),
+        Message(id=str(uuid4()), conversation_id=generation.conversation_id, sequence=generation.sequence + 2,
+                request_id=request_id, role="assistant", content=reply, model=generation.model_name),
+    ]
+    db.add_all(messages)
+    result = turn_info(conversation, request_id, messages)
+    await db.commit()
+    return result
+
+
+async def answer_message(db: AsyncSession, user_id: int, conversation_id: str,
+                         body: SendMessageRequest, agent, timeout: float):
+    """普通 JSON 发送：共用生成逻辑，等待完整回答后返回会话。"""
+    generation = await prepare_generation(db, user_id, conversation_id, body, timeout)
+    if not generation.saved:
+        try:
+            async with asyncio.timeout(generation.duration):
+                result = await agent.ainvoke({"messages": [*generation.history, ("user", body.message)]})
+            await save_generation(db, generation, result["messages"][-1].text)
+        except BaseException:
+            await release_generation(db, user_id, conversation_id, generation.lease)
+            raise
     return conversation_info(await owned_conversation(db, user_id, conversation_id))
