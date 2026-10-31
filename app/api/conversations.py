@@ -12,6 +12,7 @@ from app.llm.errors import ModelConfigurationError, ModelError
 from app.llm.factory import select_model
 from app.schemas.conversations import (
     ConversationInfo, ConversationModelInfo, ConversationModelUpdate, ConversationTitleUpdate, CreateConversationRequest,
+    ConversationKnowledgeInfo, ConversationKnowledgeUpdate,
 )
 from app.services.conversations import (
     answer_message,
@@ -22,6 +23,7 @@ from app.services.conversations import (
     list_user_conversations,
     rename_user_conversation,
     switch_conversation_model,
+    switch_conversation_knowledge,
 )
 from app.services.streaming import ConversationStreamResponse
 
@@ -44,7 +46,7 @@ async def create_conversation(body: CreateConversationRequest, request: Request,
         raise HTTPException(503, str(exc)) from None
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from None
-    return conversation_info(await create_user_conversation(db, user.id, model_name, body.first_message))
+    return conversation_info(await create_user_conversation(db, user.id, model_name, body.first_message, body.knowledge_enabled))
 
 
 @router.get("/{conversation_id}", response_model=ConversationInfo)
@@ -71,6 +73,13 @@ async def change_conversation_model(conversation_id: UUID, body: ConversationMod
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from None
     return await switch_conversation_model(db, user.id, str(conversation_id), model_name)
+
+
+@router.patch("/{conversation_id}/knowledge", response_model=ConversationKnowledgeInfo)
+async def change_conversation_knowledge(conversation_id: UUID, body: ConversationKnowledgeUpdate,
+                                        user: CurrentUser, db: Db):
+    """保存知识库开关，下一轮按服务端记录执行。"""
+    return await switch_conversation_knowledge(db, user.id, str(conversation_id), body.knowledge_enabled)
 
 
 @router.delete("/{conversation_id}", status_code=204)

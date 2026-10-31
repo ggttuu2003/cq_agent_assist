@@ -11,6 +11,7 @@ import {
 } from 'react';
 import {
   ArrowDown,
+  BookOpen,
   ArrowUp,
   ArrowUpRight,
   Check,
@@ -33,10 +34,12 @@ import {
   Trash2,
   X,
 } from 'lucide-react';
-import { attachmentUrl, createConversation, getConversation, getModels, listConversations, removeConversation, renameConversation, streamMessage, switchConversationModel, uploadImage, type Attachment, type Conversation, type ConversationTurn, type Message, type ModelOption, type User } from './api';
+import { attachmentUrl, createConversation, getConversation, getModels, listConversations, removeConversation, renameConversation, streamMessage, switchConversationKnowledge, switchConversationModel, uploadImage, type Attachment, type Conversation, type ConversationTurn, type Message, type ModelOption, type User } from './api';
 
 // Markdown 和代码高亮体积较大，首次出现回答时再加载，欢迎页可以更快显示。
 const Markdown = lazy(() => import('./Markdown'));
+const Knowledge = lazy(() => import('./Knowledge'));
+import type { KnowledgeTarget } from './knowledge-api';
 
 const SIDEBAR_WIDTH_KEY = 'cq-assist.sidebar-width';
 const SIDEBAR_MIN_WIDTH = 220;
@@ -107,6 +110,8 @@ export default function ChatWorkspace({ user, profileLoading, profileError, conn
 }) {
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [activeId, setActiveId] = useState<string | null>(loadActiveConversation);
+  const [section, setSection] = useState<'chat' | 'knowledge'>(() => new URL(location.href).searchParams.get('view') === 'knowledge' ? 'knowledge' : 'chat');
+  const [knowledgeTarget, setKnowledgeTarget] = useState<KnowledgeTarget | null>(null);
   const [historyLoading, setHistoryLoading] = useState(true);
   const [historyError, setHistoryError] = useState('');
   const [creating, setCreating] = useState(false);
@@ -120,6 +125,8 @@ export default function ChatWorkspace({ user, profileLoading, profileError, conn
   const [modelOptions, setModelOptions] = useState<ModelOption[]>([]);
   const [draftModelName, setDraftModelName] = useState('');
   const [savingModel, setSavingModel] = useState(false);
+  const [draftKnowledgeEnabled, setDraftKnowledgeEnabled] = useState(false);
+  const [savingKnowledge, setSavingKnowledge] = useState(false);
   // 同步标记先于 React 渲染生效，防止切换请求未完成时紧接着发送消息。
   const modelSwitchRef = useRef(false);
   const [sidebarOpen, setSidebarOpen] = useState(() => window.innerWidth > 760);
@@ -162,6 +169,7 @@ export default function ChatWorkspace({ user, profileLoading, profileError, conn
   const isWelcome = messages.length === 0 && !restoringConversation;
   // 已有会话使用服务端保存的选择，新对话先在草稿中选择，发送时一起创建。
   const selectedModel = active?.modelName ?? (draftModelName || defaultModelName || '');
+  const knowledgeEnabled = active?.knowledgeEnabled ?? draftKnowledgeEnabled;
   const displayedModel = selectedModel || (defaultModelError ? '模型列表不可用' : '读取模型…');
   const supportsImages = active?.imageInputSupported ??
     modelOptions.find((item) => item.model === selectedModel)?.image_input_supported;
@@ -182,8 +190,10 @@ export default function ChatWorkspace({ user, profileLoading, profileError, conn
     const url = new URL(window.location.href);
     if (activeId) url.searchParams.set('conversation', activeId);
     else url.searchParams.delete('conversation');
+    if (section === 'knowledge') url.searchParams.set('view', 'knowledge');
+    else url.searchParams.delete('view');
     if (url.href !== window.location.href) window.history.replaceState(window.history.state, '', url);
-  }, [activeId]);
+  }, [activeId, section]);
 
   useEffect(() => {
     // 模型列表独立于个人资料，只在首次进入和手动重连时读取。
@@ -478,7 +488,8 @@ export default function ChatWorkspace({ user, profileLoading, profileError, conn
         setConversations((items) => items.map((item) => item.id === conversationId ? {
           ...item, messages: item.messages.map((message) => {
             if (message.id !== messageId) return message;
-            if (event.type === 'answer_reset') return { ...message, content: '' };
+            if (event.type === 'answer_reset') return { ...message, content: '', citations: [] };
+            if (event.type === 'citations') return { ...message, citations: event.citations };
             const calls = message.toolCalls ?? [];
             return { ...message, toolCalls: calls.some((call) => call.id === event.call.id)
               ? calls.map((call) => call.id === event.call.id ? event.call : call)
@@ -495,7 +506,7 @@ export default function ChatWorkspace({ user, profileLoading, profileError, conn
         ...item, messages: item.messages.map((message) => message.id === messageId
           ? { ...message, status: cancelled ? 'cancelled' : 'error', notice,
             toolCalls: message.toolCalls?.map((call) => call.status === 'running'
-              ? { ...call, status: cancelled ? 'cancelled' : 'error', error: cancelled ? '搜索已停止' : notice } : call) } : message),
+              ? { ...call, status: cancelled ? 'cancelled' : 'error', error: cancelled ? '已停止' : notice } : call) } : message),
       } : item));
       await reconcileAnswer(conversationId, messageId);
     } finally {
@@ -585,7 +596,7 @@ export default function ChatWorkspace({ user, profileLoading, profileError, conn
     requestRef.current = controller;
     setCreating(true);
     try {
-      const conversation = active ?? await createConversation(question, selectedModel);
+      const conversation = active ?? await createConversation(question, selectedModel, draftKnowledgeEnabled);
       if (controller.signal.aborted) return;
       const answerId = createId();
       const additions: Message[] = [
@@ -649,10 +660,32 @@ export default function ChatWorkspace({ user, profileLoading, profileError, conn
     }
   }
 
+  /** 保存成功才切换显示，失败保持原值；和模型切换共用同步标记防止紧接着发送。 */
+  async function changeKnowledge() {
+    if (!user || modelSwitchRef.current || requestRef.current || pending || creating ||
+        historyLoading || historyError || restoringConversation || active?.generating) return;
+    const next = !knowledgeEnabled;
+    if (!active) { setDraftKnowledgeEnabled(next); return; }
+    modelSwitchRef.current = true;
+    setSavingKnowledge(true);
+    try {
+      const saved = await switchConversationKnowledge(active.id, next);
+      setConversations((items) => items.map((item) => item.id === saved.id
+        ? { ...item, knowledgeEnabled: saved.knowledge_enabled } : item));
+    } catch (error) {
+      setToast(error instanceof Error ? error.message : '知识库开关保存失败，请重试');
+    } finally {
+      modelSwitchRef.current = false;
+      setSavingKnowledge(false);
+    }
+  }
+
   /** 新建空白页面，直到发送第一条消息时才保存会话。 */
   function newConversation() {
+    setSection('chat');
     setActiveId(null);
     setDraftModelName('');
+    setDraftKnowledgeEnabled(false);
     setDraft('');
     clearDraftImages();
     if (window.innerWidth <= 760) setSidebarOpen(false);
@@ -661,6 +694,7 @@ export default function ChatWorkspace({ user, profileLoading, profileError, conn
 
   /** 切换时核对服务端最新记录，不调用模型。 */
   async function openConversation(id: string) {
+    setSection('chat');
     setActiveId(id);
     setDraft('');
     clearDraftImages();
@@ -810,12 +844,12 @@ export default function ChatWorkspace({ user, profileLoading, profileError, conn
               }
               fileInputRef.current?.click();
             }}
-              disabled={!user || savingModel || creating || !!pending || !!active?.generating || uploadingImages || draftImages.length >= 4}
+              disabled={!user || savingModel || savingKnowledge || creating || !!pending || !!active?.generating || uploadingImages || draftImages.length >= 4}
               aria-label="添加图片" title="添加图片，也可粘贴截图"><ImagePlus size={18} /></button>
             <label className={`model-selector ${savingModel ? 'is-saving' : ''}`} title={savingModel ? '正在保存模型选择' : '选择对话模型'}>
               {savingModel ? <span className="small-spinner" /> : <Cpu size={14} strokeWidth={1.5} aria-hidden="true" />}
               <select aria-label="选择模型" value={selectedModel} onChange={(event) => { void changeModel(event.target.value); }}
-                disabled={!user || savingModel || creating || !!pending || !!active?.generating || restoringConversation || !modelOptions.length}>
+                disabled={!user || savingModel || savingKnowledge || creating || !!pending || !!active?.generating || restoringConversation || !modelOptions.length}>
                 {!modelOptions.some((item) => item.model === selectedModel) &&
                   <option value={selectedModel} disabled>{displayedModel}</option>}
                 {modelOptions.map((item) => <option key={item.model} value={item.model}>
@@ -824,6 +858,14 @@ export default function ChatWorkspace({ user, profileLoading, profileError, conn
               </select>
               <ChevronDown size={12} aria-hidden="true" />
             </label>
+            <button type="button" role="switch" aria-label="知识库" aria-checked={knowledgeEnabled}
+              className={`knowledge-toggle ${knowledgeEnabled ? 'is-on' : ''}`}
+              title={knowledgeEnabled ? '已开启：每轮先检索个人知识库' : '已关闭：使用普通对话'}
+              disabled={!user || savingModel || savingKnowledge || creating || !!pending || !!active?.generating || historyLoading || !!historyError || restoringConversation}
+              onClick={() => void changeKnowledge()}>
+              {savingKnowledge ? <span className="small-spinner" /> : <BookOpen size={14} strokeWidth={1.5} />}
+              <span>知识库</span><span className="knowledge-switch-track" aria-hidden="true"><i /></span>
+            </button>
           </div>
           {isActivePending ? (
             <button
@@ -840,7 +882,7 @@ export default function ChatWorkspace({ user, profileLoading, profileError, conn
             <button
               className="send-button"
               type="submit"
-              disabled={(!draft.trim() && !draftImages.length) || uploadingImages || draftImages.some((item) => item.status !== 'ready') || !user || savingModel || !!pending || creating || historyLoading || !!historyError || restoringConversation || !!active?.generating || (!!activeId && renaming?.id === activeId) || draft.trim().length > 20000}
+              disabled={(!draft.trim() && !draftImages.length) || uploadingImages || draftImages.some((item) => item.status !== 'ready') || !user || savingModel || savingKnowledge || !!pending || creating || historyLoading || !!historyError || restoringConversation || !!active?.generating || (!!activeId && renaming?.id === activeId) || draft.trim().length > 20000}
               aria-label="发送消息"
               title={active?.generating && !isActivePending ? '正在核对生成状态，请稍候' : pending ? '另一段对话正在回答，请稍候' : '发送消息'}
             >
@@ -901,6 +943,9 @@ export default function ChatWorkspace({ user, profileLoading, profileError, conn
             <kbd>⌘ K</kbd>
           </button>
         </div>
+        <button className={`knowledge-nav ${section === 'knowledge' ? 'active' : ''}`} onClick={() => {
+          setKnowledgeTarget(null); setSection('knowledge'); if (window.innerWidth <= 760) setSidebarOpen(false);
+        }}><BookOpen size={17} />知识库</button>
         <div className="history-area">
           <div className="history-label">
             <span>最近对话</span>
@@ -1018,7 +1063,7 @@ export default function ChatWorkspace({ user, profileLoading, profileError, conn
         />
       </aside>
 
-      <main className={`main-panel ${isWelcome ? 'welcome-mode' : 'conversation-mode'}`}>
+      <main hidden={section !== 'chat'} className={`main-panel ${isWelcome ? 'welcome-mode' : 'conversation-mode'}`}>
         <header className="topbar">
           <div className="topbar-left">
             {!sidebarOpen && (
@@ -1089,8 +1134,11 @@ export default function ChatWorkspace({ user, profileLoading, profileError, conn
                       </div>
                       {message.toolCalls?.map((call) => (
                         <div key={call.id} className={`tool-progress tool-${call.status}`} role="status">
-                          {call.status === 'running' ? <span className="small-spinner" /> : <Globe size={14} />}
-                          <span>{call.status === 'running' ? '正在搜索网页' : call.status === 'completed'
+                          {call.status === 'running' ? <span className="small-spinner" /> : call.tool === 'knowledge_search' ? <BookOpen size={14} /> : <Globe size={14} />}
+                          <span>{call.tool === 'knowledge_search'
+                            ? call.status === 'running' ? '正在检索知识库' : call.status === 'completed'
+                              ? call.citations?.length ? `找到 ${call.citations.length} 段资料` : '未找到相关资料' : call.error ?? '知识检索失败'
+                            : call.status === 'running' ? '正在搜索网页' : call.status === 'completed'
                             ? call.sources.length ? `已搜索 ${call.sources.length} 个网页` : '未找到相关结果'
                             : call.error ?? '搜索失败'}</span>
                           <span className="tool-query" title={call.query}>{call.query}</span>
@@ -1101,6 +1149,14 @@ export default function ChatWorkspace({ user, profileLoading, profileError, conn
                           <Markdown content={message.content} />
                         </Suspense>
                       )}
+                      {!!message.citations?.length && <div className="knowledge-citations" aria-label="知识资料来源">
+                        {message.citations.map((source) => <button key={source.chunk_id} onClick={() => {
+                          setKnowledgeTarget({ documentId: source.document_id, versionId: source.version_id, chunkId: source.chunk_id, snapshot: source });
+                          setSection('knowledge');
+                        }} title={source.quote}>
+                          <BookOpen size={13} /><span>[{source.number}] {source.title}<small>{source.location}</small></span>
+                        </button>)}
+                      </div>}
                       {message.status === 'pending' ? (
                         <div className="thinking-content" role="status" aria-label="正在回答">
                           <span className="thinking-dots"><i /><i /><i /></span>
@@ -1110,7 +1166,7 @@ export default function ChatWorkspace({ user, profileLoading, profileError, conn
                           <p>{message.status === 'error' ? `生成失败：${message.notice ?? '请重试'}` : message.notice ?? '已停止生成'}</p>
                           {active?.generating && <p role="status">正在确认生成状态…</p>}
                           <button className="text-button" onClick={() => retryMessage(message.id)}
-                            disabled={savingModel || !!pending || !!active?.generating}>
+                            disabled={savingModel || savingKnowledge || !!pending || !!active?.generating}>
                             <RotateCcw size={13} />
                             {message.status === 'error' ? '重试' : '重新回答'}
                           </button>
@@ -1140,6 +1196,11 @@ export default function ChatWorkspace({ user, profileLoading, profileError, conn
 
         {!isWelcome && !restoringConversation && composer}
       </main>
+      {section === 'knowledge' && user && <Suspense fallback={<main className="main-panel knowledge-panel"><p className="knowledge-detail-loading">正在加载知识库…</p></main>}>
+        <Knowledge target={knowledgeTarget} onBack={() => setSection('chat')} onMenu={() => setSidebarOpen(true)} showMenu={!sidebarOpen} />
+      </Suspense>}
+      {section === 'knowledge' && !user && <main className="main-panel knowledge-panel"><div className="knowledge-empty">{profileError || '正在连接服务…'}
+        <button className="text-button" onClick={onRetryProfile}>重新连接</button></div></main>}
 
       <dialog
         ref={searchDialogRef}

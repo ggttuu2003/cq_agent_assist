@@ -5,12 +5,14 @@ from uuid import UUID
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 from app.schemas.attachments import AttachmentInfo
+from app.schemas.knowledge import Citation
 
 
 class CreateConversationRequest(BaseModel):
     """首次问题用于生成初始标题，消息仍由发送接口保存。"""
     first_message: str = Field(min_length=1, max_length=20000)
     model_name: str | None = Field(default=None, min_length=1, max_length=200)
+    knowledge_enabled: bool = Field(default=False, strict=True)
 
     @field_validator("model_name", mode="before")
     @classmethod
@@ -71,6 +73,16 @@ class ConversationModelInfo(BaseModel):
     image_input_supported: bool | None = None
 
 
+class ConversationKnowledgeUpdate(BaseModel):
+    """知识库开关由会话保存，拒绝把字符串当成布尔值。"""
+    knowledge_enabled: bool = Field(strict=True)
+
+
+class ConversationKnowledgeInfo(ConversationKnowledgeUpdate):
+    """只返回已保存的开关，避免覆盖客户端正在显示的问答。"""
+    id: str
+
+
 class MessageInfo(BaseModel):
     """已保存的消息，同时记录本轮请求和实际使用的模型。"""
     id: str
@@ -79,6 +91,7 @@ class MessageInfo(BaseModel):
     model: str | None
     request_id: str
     attachments: list[AttachmentInfo] = Field(default_factory=list)
+    citations: list[Citation] = Field(default_factory=list)
 
 
 class ConversationInfo(BaseModel):
@@ -86,6 +99,7 @@ class ConversationInfo(BaseModel):
     id: str
     title: str
     model_name: str
+    knowledge_enabled: bool = False
     image_input_supported: bool | None = None
     updated_at: datetime
     messages: list[MessageInfo]

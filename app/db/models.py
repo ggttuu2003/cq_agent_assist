@@ -2,7 +2,7 @@
 
 from datetime import datetime
 
-from sqlalchemy import DateTime, ForeignKey, Index, Integer, String, Text, UniqueConstraint
+from sqlalchemy import JSON, Boolean, DateTime, ForeignKey, Index, Integer, String, Text, UniqueConstraint
 from sqlalchemy.dialects.mysql import LONGTEXT
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
@@ -40,6 +40,7 @@ class Conversation(Base):
     user_id: Mapped[int] = mapped_column(ForeignKey("cq_user.id", ondelete="CASCADE"), comment="所属用户")
     title: Mapped[str] = mapped_column(String(120), default="新对话", comment="会话标题，创建时生成，可手动修改")
     model_name: Mapped[str] = mapped_column(String(200), default="", comment="本会话使用的模型")
+    knowledge_enabled: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0", comment="是否每轮先检索知识库")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, comment="创建时间，UTC")
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, comment="最近完成对话时间，UTC")
     active_request: Mapped[str | None] = mapped_column(String(36), nullable=True, comment="正在生成的请求UUID")
@@ -93,6 +94,8 @@ class Message(Base):
     attachment_links: Mapped[list[MessageAttachment]] = relationship(
         order_by=MessageAttachment.position, cascade="all, delete-orphan", passive_deletes=True, lazy="raise",
     )
+
+    citations: Mapped[list[dict] | None] = mapped_column(JSON, default=list, nullable=True, comment="本轮知识资料引用快照")
 
     @property
     def attachments(self) -> list[Attachment]:

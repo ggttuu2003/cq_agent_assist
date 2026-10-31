@@ -2,13 +2,13 @@
 
 一个使用 Python 构建的个人 Agent 项目。
 
-当前提供本地个人资料、MySQL 会话保存、多轮流式对话、图片理解和可选的联网搜索：
+当前提供本地个人资料、MySQL 会话保存、多轮流式对话、图片理解、联网搜索和个人知识库：
 
 ```text
 FastAPI → LangGraph 对话图 → LangChain 模型客户端 → 阿里百炼
 ```
 
-RSS、RAG、MCP、插件、多模态和沙箱等功能，等真正开始实现时再逐步加入，不提前安装或配置。
+知识库当前支持 TXT / Markdown 上传和自动检索。PDF / DOCX、RSS、MCP、插件及沙箱按后续阶段增加。
 
 ## 本地启动
 
@@ -19,8 +19,10 @@ RSS、RAG、MCP、插件、多模态和沙箱等功能，等真正开始实现�
 ```bash
 cd /Users/yizhoucp/IdeaProjects/self-project/CQ-agent-assist
 conda activate cq-agent-assist
-python -m uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
+python -m uvicorn app.main:app --reload --reload-include ".env" --host 127.0.0.1 --port 8000
 ```
+
+这条开发命令会监控 Python 文件和 `.env`，修改配置后会自动重启后端。仅使用 `--reload` 默认不监控 `.env`；使用旧命令或 IDEA 普通运行时，修改配置后需要手动重启。
 
 看到 `Application startup complete` 后，再启动前端。后端地址：<http://127.0.0.1:8000/docs>。
 
@@ -71,8 +73,9 @@ curl http://127.0.0.1:8000/models/default
 6. 流式展示模型回答，支持停止、重试和刷新恢复当前会话
 7. 模型按需调用联网搜索，回答附上真实搜索来源；搜索服务通过适配器替换
 8. 上传图片或粘贴截图进行提问，保存图片历史并支持后续追问
+9. 管理个人知识资料，后台解析和建立 Milvus 索引，按会话知识库开关检索并保存引用
 
-MySQL 已用于保存个人资料、会话和消息。Milvus 尚未连接，检索按后续需求增加。当前没有账号密码登录，只适合本机个人使用；同一服务的浏览器访问者共享一份个人资料。
+MySQL 已用于保存个人资料、会话和消息。Milvus 用于知识资料的向量检索，普通聊天不依赖 Milvus。当前没有账号密码登录，只适合本机个人使用；同一服务的浏览器访问者共享一份个人资料。
 
 ## 环境准备
 
@@ -90,7 +93,7 @@ python -m pip install -r requirements.txt
 cp .env.example .env
 ```
 
-MySQL 连接配置放在 `.env`；Milvus 配置暂不使用：
+MySQL 及 Milvus 连接配置放在 `.env`：
 
 ```env
 MYSQL_HOST=127.0.0.1
@@ -121,7 +124,7 @@ requirements.txt
 
 后续开始实现具体功能时，再按实际需要添加对应依赖。例如实现 RSS 时再添加 RSS 解析库，实现 MCP 时再添加 MCP SDK，实现图片检索时再添加多模态模型依赖。
 
-应用启动时自动创建缺失的 `cq_user`、`cq_conversation`、`cq_message`、`cq_attachment` 和 `cq_message_attachment` 表。旧版本会话表会补充 `model_name` 字段，优先按历史回答中的模型回填，没有记录时使用当前默认模型。
+应用启动时自动创建缺失的 `cq_user`、`cq_conversation`、`cq_message`、`cq_attachment` 和 `cq_message_attachment` 表，同时创建四张 `cq_knowledge_*` 资料、版本、分段与任务表。旧消息表自动补充 `citations` JSON 字段，保存引用快照。旧版本会话表会补充默认关闭的 `knowledge_enabled` 字段；`model_name` 字段缺失时也会补充，优先按历史回答中的模型回填，没有记录时使用当前默认模型。
 
 ## 模型配置和对话
 
@@ -153,6 +156,41 @@ LLM_MODELS=["qwen-plus","qwen3-vl-plus"]
 当前 LangGraph 流程为 `START → model`。模型需要搜索时进入 `tools → model`，直接给出答案时结束。`MessagesState` 保存本次调用的消息，模型节点通过 `ainvoke` 生成回答。图本身不保存跨请求状态；会话接口从 MySQL 读取最近 20 轮、最多约 6 万字符的历史，再交给图。不同会话的上下文互不混用。原 `/chat` 仍是单轮调试接口，不保存历史。
 
 在 IDEA 中打开 `tests/test_chat.py`，点击测试类或方法左侧的绿色三角即可运行。测试使用模拟服务，不会调用百炼。
+
+## 个人知识库
+
+第一版使用方式：侧边栏打开“知识库” → 上传 TXT / Markdown → 等状态变为“可检索” → 回到聊天，在输入框旁开启“知识库”再提问。开启后每轮固定先执行检索，不依赖模型主动选工具；关闭时走普通对话，不访问个人知识库，联网搜索仍可使用。新对话默认关闭，已有会话的开关保存在 MySQL，刷新和换客户端后恢复，生成期间禁止切换。
+
+命中时展示可打开的资料来源；没有命中时显示“未找到相关资料”，允许模型继续回答；检索失败会明确显示错误。短追问会结合最近一轮的有限文字检索，当前只支持文本语义检索，图片理解保持原有流程。历史引用不会因为关闭开关而消失，已完成请求的重放也不会再次检索。
+
+需要先启动 Milvus，并在现有 `.env` 中增加独立的向量模型配置；不要用聊天模型名代替向量模型名：
+
+```env
+EMBEDDING_MODEL=text-embedding-v4
+EMBEDDING_DIMENSIONS=1024
+```
+
+以上是百炼向量模型示例，需确认当前账号与地域可用。Embedding 默认复用 `LLM_BASE_URL`、`LLM_API_KEY`；要使用另一家兼容服务时，单独填写 `EMBEDDING_BASE_URL`、`EMBEDDING_API_KEY`。没有添加这两个配置时无需重复填写密钥。修改配置后重启后端。当前本地 `.env` 不会被模板覆盖，也不会自动选择新的模型。
+
+Milvus 使用 `.env` 的 `MILVUS_URI`、`MILVUS_TOKEN` 和 `MILVUS_COLLECTION`。后端首次建立索引时自动创建集合，集合名包含向量与分段配置指纹，避免不同配置的向量混用。如果 Milvus 已经在运行，直接使用现有实例。部署新实例可参考 [Milvus 官方安装说明](https://milvus.io/docs/install-overview.md)。缺少向量模型配置或 Milvus 不可用时，普通聊天和联网搜索仍可使用，资料页面会展示处理失败原因，可修正后重试。
+
+单文件最多 20 MB，每批最多 10 份。页面支持批量选择或拖入、资料名称搜索、正文语义检索、正文与分段预览、改名、替换内容、重新处理和删除。上传保存后返回 HTTP 202，后端常驻处理器从 MySQL 领取持久化任务，刷新或离开页面不会中断处理。每个处理器同时处理一份资料，应用重启会恢复未完成任务。
+
+替换内容或重新处理会建立新版本，完整成功前旧版继续可检索；失败不会发布部分向量。删除先停止检索，再清理向量和文件，清理失败可点击删除按钮重试。原文件保存在 `data/knowledge/`，MySQL 保存正文与元数据，Milvus 保存向量。备份时保存这三部分，文件目录已经被 Git 忽略。
+
+旧回答保存当时的资料名称、版本、位置和摘录。资料更新或删除后，仍能从历史回答查看引用摘录，不会把旧引用当作新版原文展示。更换向量模型、维度或分段设置后，需要在知识库中重新处理资料；切换聊天模型无需重建索引。
+
+API 与完整后续需求见 [006-RAG知识库与检索问答需求-2026-10-30.md](doc/006-RAG知识库与检索问答需求-2026-10-30.md)。当前完成该文档第一阶段，PDF / DOCX 与 RSS 等来源按后续阶段接入。
+
+知识库测试不消耗真实模型额度，在 IDEA 可直接运行 `tests/test_knowledge.py`。以下命令分别测试解析与协议、隔离 MySQL 的完整业务流程，以及真实 Milvus 临时集合：
+
+```bash
+python -m unittest tests.test_knowledge -v
+CQ_TEST_MYSQL=1 python -m unittest tests.test_knowledge -v
+CQ_TEST_MILVUS=1 python -m unittest tests.test_knowledge.TestMilvusIntegration -v
+```
+
+MySQL 测试创建并清理随机临时库，Milvus 测试创建并清理随机临时集合，均不修改个人资料；Embedding 和聊天模型使用模拟响应。
 
 ## 图片理解
 
@@ -220,7 +258,7 @@ Tavily 的搜索 Key 与百炼模型 Key 是两份不同的配置；选择 Tavil
 
 开发时，页面请求 `/api/*`，Vite 将其转发给 `http://127.0.0.1:8000/*`。模型地址和密钥继续使用后端 `.env`，前端不需要配置密钥。
 
-输入框左下角显示当前模型名称。新会话通过 `GET /api/models/default` 读取后端的 `LLM_MODEL` 作为默认模型；已有会话使用会话自身保存的模型名称。默认模型接口只读取配置，不会调用模型服务。创建会话时保存当时的默认模型；后续发送使用会话绑定的模型，修改 `LLM_MODEL` 并重启后只影响之后创建的会话。每条回答也记录使用的模型，当前页面暂不提供模型切换。
+输入框左下角显示当前模型名称。新会话通过 `GET /api/models/default` 读取后端的 `LLM_MODEL` 作为默认模型；已有会话使用会话自身保存的模型名称。默认模型接口只读取配置，不会调用模型服务。创建会话时保存当时的默认模型；后续发送使用会话绑定的模型，修改 `LLM_MODEL` 并重启后只影响之后创建的会话。每条回答也记录使用的模型，页面输入框旁支持切换到配置中的其他模型。
 
 打开页面立即显示聊天主界面，后端在后台准备随机默认昵称，不需要手动填写。加载或连接失败时仍停留在主界面，可输入内容并重试连接，连接完成后即可发送。侧栏底部显示个人资料，点击资料按钮可修改。昵称没有登录认证功能。会话和成功完成的问答保存在 MySQL，刷新或换浏览器后仍可查看；旧版 localStorage 匿名历史原样保留，本次不自动导入。
 
@@ -250,14 +288,16 @@ app/
 │   ├── chat.py            # 模型信息与单轮调试接口
 │   ├── conversations.py   # 会话管理与多轮对话接口
 │   ├── attachments.py     # 图片上传与读取接口
+│   ├── knowledge.py       # 知识资料管理与检索接口
 │   ├── health.py          # 健康检查
 │   └── profile.py         # 本地昵称资料接口
 ├── dependencies.py        # 数据库、个人资料和 Agent 的接口依赖
 ├── schemas/               # 接口数据结构和校验
-├── agent/                 # LangGraph 编排
+├── agent/                 # LangGraph 编排与开关控制的固定检索节点
 ├── llm/                   # 模型服务
+├── knowledge/             # 文本解析分段、向量适配器和持久化任务执行
 ├── search/                # 统一搜索接口、服务选择和搜索服务适配器
-├── tools/                 # 模型可调用的工具，当前提供 web_search
+├── tools/                 # 模型可调用的工具，提供 web_search；知识检索由固定节点执行
 ├── core/                  # 基础配置和通用协议
 ├── db/                    # MySQL 连接和表模型
 ├── services/              # 个人资料、会话等业务逻辑
@@ -269,6 +309,8 @@ frontend/
 ├── src/
 │   ├── App.tsx            # 聊天页面、会话状态和交互
 │   ├── Profile.tsx        # 昵称设置与资料编辑
+│   ├── Knowledge.tsx      # 知识资料上传、状态和预览
+│   ├── knowledge-api.ts   # 知识库接口与引用定位
 │   ├── api.ts             # 请求 Python 后端
 │   ├── Markdown.tsx       # Markdown 展示和代码复制
 │   ├── styles.css         # 页面布局、深浅主题和手机适配
@@ -287,8 +329,9 @@ frontend/
 - `GET /models/default`：读取新会话的默认模型。
 - `GET /profile`：读取当前个人资料；第一次访问时自动生成随机默认昵称。
 - `PUT /profile`：修改昵称，例如 `{"display_name": "长青"}`。
-- `GET /conversations`：加载会话。
-- `POST /conversations`：发送 `{"first_message": "首次问题"}` 创建会话，后端立即保存问题前 28 个字符作为标题；不调用模型，模型失败后标题仍保留。前端直接使用返回的标题，发送消息接口不再修改标题。
+- `GET /conversations`：加载会话，包含 `knowledge_enabled`。
+- `PATCH /conversations/{id}/knowledge`：发送 `{"knowledge_enabled":true}` 保存会话知识库开关，只返回编号与开关值；生成中返回 409。
+- `POST /conversations`：发送 `{"first_message": "首次问题", "knowledge_enabled": false}` 创建会话，后端立即保存问题前 28 个字符作为标题；不调用模型，模型失败后标题仍保留。前端直接使用返回的标题，发送消息接口不再修改标题。
 - `GET /conversations/{id}`、`DELETE /conversations/{id}`：详情或删除。
 - `POST /conversations/{id}/messages`：使用会话绑定的模型发送 `{"message": "你好", "request_id": "本轮UUID"}`；返回保存后的完整会话。重试使用相同请求编号。
 - `POST /conversations/{id}/messages/stream`：前端发送与重试使用此接口，请求同上；返回 `delta` 文字片段、`done` 已保存问答或 `error` 事件。工具调用时增加 `tool_start`、`tool_end`；`answer_reset` 清除模型调用工具前的过渡文字。浏览器请求路径加 `/api` 前缀。

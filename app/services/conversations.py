@@ -15,8 +15,9 @@ from sqlalchemy.orm import selectinload
 
 from app.db.models import Conversation, Message, MessageAttachment, utc_now
 from app.llm.errors import ModelError
+from app.services.knowledge import validate_citations
 from app.llm.factory import image_input_support
-from app.schemas.conversations import ConversationInfo, ConversationModelInfo, ConversationTurnInfo, MessageInfo, SendMessageRequest
+from app.schemas.conversations import ConversationInfo, ConversationKnowledgeInfo, ConversationModelInfo, ConversationTurnInfo, MessageInfo, SendMessageRequest
 from app.services.attachments import (
     MAX_IMAGES, MAX_IMAGE_TOTAL_SIZE, attachment_info, get_attachments, message_content,
 )
@@ -28,7 +29,7 @@ def message_info(message: Message) -> MessageInfo:
     """消息正文与附件描述一起返回，图片内容由独立接口读取。"""
     return MessageInfo(id=message.id, role=message.role, content=message.content, model=message.model,
                        request_id=message.request_id,
-                       attachments=[attachment_info(item) for item in message.attachments])
+                       attachments=[attachment_info(item) for item in message.attachments], citations=message.citations or [])
 
 
 def conversation_info(conversation: Conversation) -> ConversationInfo:
@@ -36,6 +37,7 @@ def conversation_info(conversation: Conversation) -> ConversationInfo:
     return ConversationInfo(
         id=conversation.id, title=conversation.title,
         model_name=conversation.model_name,
+        knowledge_enabled=conversation.knowledge_enabled,
         image_input_supported=image_input_support(conversation.model_name),
         updated_at=conversation.updated_at.replace(tzinfo=timezone.utc),
         generating=bool(conversation.busy_until and conversation.busy_until > utc_now()),
@@ -55,10 +57,10 @@ async def list_user_conversations(db: AsyncSession, user_id: int) -> list[Conver
 
 
 async def create_user_conversation(db: AsyncSession, user_id: int, model_name: str,
-                                   first_message: str) -> Conversation:
+                                   first_message: str, knowledge_enabled: bool = False) -> Conversation:
     """创建时保存首次问题前 28 个字符作为标题，不依赖模型返回。"""
     conversation = Conversation(id=str(uuid4()), user_id=user_id, model_name=model_name,
-                                title=first_message[:28])
+                                title=first_message[:28], knowledge_enabled=knowledge_enabled)
     db.add(conversation)
     await db.commit()
     logger.info("会话创建成功 会话=%s 用户=%s 模型=%s", conversation.id, user_id, model_name)
@@ -99,6 +101,19 @@ async def switch_conversation_model(db: AsyncSession, user_id: int, conversation
     logger.info("会话模型切换成功 会话=%s 原模型=%s 新模型=%s", conversation_id, previous_model, model_name)
     return ConversationModelInfo(id=conversation_id, model_name=model_name,
                                  image_input_supported=image_input_support(model_name))
+
+
+async def switch_conversation_knowledge(db: AsyncSession, user_id: int, conversation_id: str,
+                                        enabled: bool) -> ConversationKnowledgeInfo:
+    """和生成领取使用同一把短事务行锁，本轮开始后不能改变开关。"""
+    await db.commit()
+    conversation = await owned_conversation(db, user_id, conversation_id, lock=True)
+    if conversation.busy_until and conversation.busy_until > utc_now():
+        raise HTTPException(409, "会话正在回答，请停止或等待完成后再切换知识库")
+    conversation.knowledge_enabled = enabled
+    await db.commit()
+    logger.info("会话知识库开关已保存 会话=%s 开启=%s", conversation_id, enabled)
+    return ConversationKnowledgeInfo(id=conversation_id, knowledge_enabled=enabled)
 
 
 async def owned_conversation(db: AsyncSession, user_id: int, conversation_id: str, *, lock=False):
@@ -170,6 +185,8 @@ class Generation:
     current_content: str | list[dict] | None = None
     sequence: int = 0
     saved: ConversationTurnInfo | None = None
+    citations: list[dict] = field(default_factory=list)
+    knowledge_enabled: bool = False
 
 
 def turn_info(conversation: Conversation, request_id: str, messages: list[Message]) -> ConversationTurnInfo:
@@ -195,6 +212,7 @@ async def prepare_generation(db: AsyncSession, user_id: int, conversation_id: st
     await db.commit()
     conversation = await owned_conversation(db, user_id, conversation_id, lock=True)
     generation.model_name = conversation.model_name
+    generation.knowledge_enabled = conversation.knowledge_enabled
     previous = list((await db.scalars(select(Message).where(
         Message.conversation_id == conversation_id, Message.request_id == request_id,
     ).options(selectinload(Message.attachment_links).selectinload(MessageAttachment.attachment))
@@ -258,7 +276,9 @@ async def save_generation(db: AsyncSession, generation: Generation, reply: str) 
         logger.warning("保存回答时生成占用已失效 会话=%s 消息请求=%s",
                        generation.conversation_id, generation.body.request_id)
         raise HTTPException(409, "本次请求已过期，请重新打开会话")
-    conversation.updated_at = utc_now()
+    await validate_citations(db, generation.user_id, generation.citations)
+    # MySQL 当前字段精度为秒，首个响应与按请求编号重放时保持同一时间。
+    conversation.updated_at = utc_now().replace(microsecond=0)
     conversation.active_request = None
     conversation.busy_until = None
     request_id = str(generation.body.request_id)
@@ -269,7 +289,7 @@ async def save_generation(db: AsyncSession, generation: Generation, reply: str) 
                 attachment_links=[MessageAttachment(position=index, attachment=item)
                                   for index, item in enumerate(attachments)]),
         Message(id=str(uuid4()), conversation_id=generation.conversation_id, sequence=generation.sequence + 2,
-                request_id=request_id, role="assistant", content=reply, model=generation.model_name, attachment_links=[]),
+                request_id=request_id, role="assistant", content=reply, model=generation.model_name, attachment_links=[], citations=generation.citations),
     ]
     db.add_all(messages)
     result = turn_info(conversation, request_id, messages)
@@ -287,6 +307,7 @@ async def answer_message(db: AsyncSession, generation: Generation, agent):
             async with asyncio.timeout(generation.duration):
                 result = await agent.ainvoke({"messages": [*generation.history,
                                                           ("user", generation.current_content or body.message)]})
+            generation.citations = result.get("citations", [])
             await save_generation(db, generation, result["messages"][-1].text)
         except BaseException as exc:
             if isinstance(exc, asyncio.CancelledError):

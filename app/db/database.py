@@ -6,6 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 
 from app.core.settings import Settings
 from app.db.models import Base
+from app.db import knowledge  # 注册知识资料表，交给同一份 metadata 创建。
 
 
 def create_database(settings: Settings):
@@ -23,6 +24,11 @@ async def initialize_database(engine, default_model: str = "") -> None:
     """创建缺失的表，并为旧会话补上模型字段。"""
     async with engine.begin() as connection:
         await connection.run_sync(Base.metadata.create_all)
+        message_columns = await connection.run_sync(
+            lambda sync_connection: [column["name"] for column in inspect(sync_connection).get_columns("cq_message")]
+        )
+        if "citations" not in message_columns:
+            await connection.execute(text("ALTER TABLE cq_message ADD COLUMN citations JSON NULL COMMENT '知识资料引用快照'"))
         attachment_columns = await connection.run_sync(
             lambda sync_connection: [column["name"] for column in inspect(sync_connection)
                                      .get_columns("cq_message_attachment")]
@@ -39,6 +45,10 @@ async def initialize_database(engine, default_model: str = "") -> None:
         if "model_name" not in columns:
             await connection.execute(text(
                 "ALTER TABLE cq_conversation ADD COLUMN model_name VARCHAR(200) NOT NULL DEFAULT '' COMMENT '本会话使用的模型'"
+            ))
+        if "knowledge_enabled" not in columns:
+            await connection.execute(text(
+                "ALTER TABLE cq_conversation ADD COLUMN knowledge_enabled BOOLEAN NOT NULL DEFAULT 0 COMMENT '是否每轮先检索知识库'"
             ))
         # 旧会话优先沿用历史回答中的模型，不能全部覆盖成新的默认模型。
         await connection.execute(text("""

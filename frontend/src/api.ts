@@ -1,15 +1,18 @@
 /** 本地个人资料只含昵称，不代表已登录用户。 */
 export type User = { id: number; display_name: string };
 export type Attachment = { id: string; name: string; media_type: string; size: number; url: string };
+export type Citation = { number: number; document_id: string; version_id: string; chunk_id: string;
+  title: string; location: string; quote: string };
 export type ToolCall = {
   id: string;
   tool: string;
   query: string;
   status: 'running' | 'completed' | 'error' | 'cancelled';
   sources: { title: string; url: string }[];
+  citations?: Citation[];
   error?: string | null;
 };
-export type StreamProgress = { type: 'answer_reset' } | { type: 'tool'; call: ToolCall };
+export type StreamProgress = { type: 'answer_reset' } | { type: 'tool'; call: ToolCall } | { type: 'citations'; citations: Citation[] };
 export type Message = {
   id: string;
   role: 'user' | 'assistant';
@@ -20,11 +23,13 @@ export type Message = {
   notice?: string;
   toolCalls?: ToolCall[];
   attachments?: Attachment[];
+  citations?: Citation[];
 };
 export type Conversation = {
   id: string;
   title: string;
   modelName: string;
+  knowledgeEnabled: boolean;
   imageInputSupported?: boolean | null;
   updatedAt: number;
   messages: Message[];
@@ -32,9 +37,9 @@ export type Conversation = {
 };
 
 type SavedMessage = { id: string; role: 'user' | 'assistant'; content: string; request_id: string;
-  model: string | null; attachments?: Attachment[] };
+  model: string | null; attachments?: Attachment[]; citations?: Citation[] };
 type SavedConversation = {
-  id: string; title: string; model_name: string; image_input_supported?: boolean | null; updated_at: string; generating: boolean;
+  id: string; title: string; model_name: string; knowledge_enabled?: boolean; image_input_supported?: boolean | null; updated_at: string; generating: boolean;
   messages: SavedMessage[];
 };
 
@@ -70,11 +75,12 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
 function toConversation(data: SavedConversation): Conversation {
   return {
     id: data.id, title: data.title, modelName: data.model_name, imageInputSupported: data.image_input_supported,
+    knowledgeEnabled: data.knowledge_enabled ?? false,
     updatedAt: Date.parse(data.updated_at), generating: data.generating,
     messages: data.messages.map((message) => ({
       id: message.id, role: message.role, content: message.content,
       requestId: message.request_id, model: message.model,
-      attachments: message.attachments ?? [],
+      attachments: message.attachments ?? [], citations: message.citations ?? [],
     })),
   };
 }
@@ -121,11 +127,17 @@ export async function listConversations(signal?: AbortSignal): Promise<Conversat
   return (await request<SavedConversation[]>('/conversations', { signal })).map(toConversation);
 }
 /** 首次问题交给后端生成并保存标题，页面直接使用接口返回的标题。 */
-export async function createConversation(firstMessage: string, modelName?: string): Promise<Conversation> {
+export async function createConversation(firstMessage: string, modelName?: string, knowledgeEnabled = false): Promise<Conversation> {
   return toConversation(await request<SavedConversation>('/conversations', {
-    method: 'POST', body: JSON.stringify({ first_message: firstMessage, model_name: modelName || undefined }),
+    method: 'POST', body: JSON.stringify({ first_message: firstMessage, model_name: modelName || undefined, knowledge_enabled: knowledgeEnabled }),
   }));
 }
+
+/** 仅合并保存后的开关，不用切换响应覆盖已有消息。 */
+export const switchConversationKnowledge = (id: string, knowledge_enabled: boolean) =>
+  request<{ id: string; knowledge_enabled: boolean }>(`/conversations/${id}/knowledge`, {
+    method: 'PATCH', body: JSON.stringify({ knowledge_enabled }), signal: AbortSignal.timeout(15000),
+  });
 export async function getConversation(id: string, signal?: AbortSignal): Promise<Conversation> {
   return toConversation(await request<SavedConversation>(`/conversations/${id}`, {
     signal: signal ?? AbortSignal.timeout(15000),
@@ -140,6 +152,12 @@ export async function renameConversation(id: string, title: string): Promise<Con
   }));
 }
 
+/** 来源结构仅接受服务器生成的定位信息，不把模型正文当作资料地址。 */
+function validCitations(value: unknown): value is Citation[] {
+  return Array.isArray(value) && value.every((item) => item && Number.isInteger(item.number) && item.number > 0 &&
+    ['document_id', 'version_id', 'chunk_id', 'title', 'location', 'quote'].every((key) => typeof item[key] === 'string'));
+}
+
 /** 解析一个完整 SSE 事件；注释是心跳，文字片段立即交给聊天页面。 */
 function readStreamEvent(block: string, id: string, requestId: string,
   onDelta: (text: string) => void, onProgress?: (event: StreamProgress) => void): ConversationTurn | undefined {
@@ -147,12 +165,27 @@ function readStreamEvent(block: string, id: string, requestId: string,
   const event = lines.find((line) => line.startsWith('event:'))?.slice(6).trim();
   const payload = lines.filter((line) => line.startsWith('data:'))
     .map((line) => line.slice(5).replace(/^ /, '')).join('\n');
-  if (!payload || !['delta', 'done', 'error', 'answer_reset', 'tool_start', 'tool_end'].includes(event ?? '')) return;
+  if (!payload || !['delta', 'done', 'error', 'answer_reset', 'tool_start', 'tool_end', 'retrieval_start', 'retrieval_end', 'citations'].includes(event ?? '')) return;
   const data = JSON.parse(payload);
   if (data.request_id !== requestId) throw new Error('回答请求编号不匹配，请重新打开会话。');
   if (event === 'error') throw new Error(typeof data.message === 'string' ? data.message : '生成失败，请重试。');
   if (event === 'answer_reset') {
     onProgress?.({ type: 'answer_reset' });
+    return;
+  }
+  if (event === 'citations') {
+    if (!validCitations(data.citations)) throw new Error('资料引用格式不正确，请重试');
+    onProgress?.({ type: 'citations', citations: data.citations });
+    return;
+  }
+  if (event === 'retrieval_start' || event === 'retrieval_end') {
+    if (typeof data.call_id !== 'string' || data.tool !== 'knowledge_search' || typeof data.query !== 'string' ||
+      (event === 'retrieval_end' && (!['completed', 'error'].includes(data.status) || !validCitations(data.citations)))) {
+      throw new Error('知识检索数据格式不正确，请重试');
+    }
+    onProgress?.({ type: 'tool', call: { id: data.call_id, tool: data.tool, query: data.query,
+      status: event === 'retrieval_start' ? 'running' : data.status, sources: [],
+      citations: data.citations ?? [], error: data.error } });
     return;
   }
   if (event === 'tool_start' || event === 'tool_end') {
@@ -185,7 +218,7 @@ function readStreamEvent(block: string, id: string, requestId: string,
     requestId, conversationId: id, updatedAt: Date.parse(data.updated_at),
     messages: data.messages.map((item: SavedMessage) => ({
       id: item.id, role: item.role, content: item.content, requestId: item.request_id, model: item.model,
-      attachments: item.attachments ?? [],
+      attachments: item.attachments ?? [], citations: item.citations ?? [],
     })),
   };
 }

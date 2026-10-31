@@ -40,6 +40,16 @@ class Settings(BaseSettings):
     milvus_token: str = ""
     milvus_collection: str = "cq_agent_assist"
 
+    # Embedding 与聊天模型独立；地址和密钥留空时复用现有百炼兼容服务。
+    embedding_model: str = ""
+    embedding_base_url: str = ""
+    embedding_api_key: SecretStr = SecretStr("")
+    embedding_dimensions: int = Field(default=1024, ge=64, le=4096)
+    knowledge_chunk_size: int = Field(default=800, ge=100, le=3000)
+    knowledge_chunk_overlap: int = Field(default=100, ge=0, le=1000)
+    knowledge_top_k: int = Field(default=5, ge=1, le=10)
+    knowledge_min_score: float = Field(default=0.25, ge=-1, le=1)
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",

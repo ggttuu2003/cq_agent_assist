@@ -62,7 +62,7 @@ def get_model_agent(request: Request, model_name: str) -> CompiledStateGraph:
 
 async def get_agent(request: Request) -> CompiledStateGraph:
     """给单轮调试接口提供默认模型的图。"""
-    return get_model_agent(request, request.app.state.settings.llm_model)
+    return with_knowledge_context(request, get_model_agent(request, request.app.state.settings.llm_model), 1)
 
 
 async def get_generation(
@@ -84,9 +84,18 @@ async def get_conversation_agent(
     if generation.saved:
         return None
     try:
-        return get_model_agent(request, generation.model_name)
+        return with_knowledge_context(request, get_model_agent(request, generation.model_name), generation.user_id, generation.knowledge_enabled)
     except BaseException:
         # 配置错误发生在领取占用之后，也要释放标记，避免会话一直显示正在回答。
         with anyio.CancelScope(shield=True):
             await release_generation(db, generation.user_id, generation.conversation_id, generation.lease)
         raise
+
+
+def with_knowledge_context(request: Request, agent, user_id: int, enabled: bool = False):
+    """按模型复用图，开关和用户只写入本轮配置，不改变共享图。"""
+    config = dict(agent.config.get("configurable", {}))
+    config.update(knowledge_enabled=enabled)
+    if enabled:
+        config.update(knowledge_service=getattr(request.app.state, "knowledge", None), knowledge_user_id=user_id)
+    return agent.with_config({"configurable": config})

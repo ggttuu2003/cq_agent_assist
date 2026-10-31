@@ -133,6 +133,19 @@ class ConversationStreamResponse(StreamingResponse):
                             yield sse_event("delta", {"request_id": request_id, "text": message.text})
                     continue
 
+                preparation = data.get("prepare_retrieval")
+                if preparation:
+                    calls["knowledge-fixed"] = preparation["retrieval_query"]
+                    yield sse_event("retrieval_start", {"request_id": request_id,
+                        "call_id": "knowledge-fixed", "tool": "knowledge_search", "query": preparation["retrieval_query"]})
+                retrieval_result = data.get("retrieve")
+                if retrieval_result:
+                    result = retrieval_result["retrieval"]
+                    yield sse_event("retrieval_end", {"request_id": request_id,
+                        "call_id": "knowledge-fixed", "tool": "knowledge_search", "query": calls.get("knowledge-fixed", ""),
+                        "status": "error" if result["error"] else "completed", "error": result["error"],
+                        "citations": result["citations"], "sources": []})
+
                 model_result = data.get("model")
                 if model_result:
                     response = model_result["messages"][-1]
@@ -144,7 +157,7 @@ class ConversationStreamResponse(StreamingResponse):
                         for call in response.tool_calls:
                             query = str(call["args"].get("query", ""))[:400]
                             calls[call["id"]] = query
-                            yield sse_event("tool_start", {"request_id": request_id,
+                            yield sse_event("retrieval_start" if call["name"] == "knowledge_search" else "tool_start", {"request_id": request_id,
                                 "call_id": call["id"], "tool": call["name"], "query": query})
                     else:
                         # 模型节点会在最终正文后追加真实来源；只补发尚未流式输出的部分。
@@ -154,6 +167,9 @@ class ConversationStreamResponse(StreamingResponse):
                         else:
                             remaining = text
                             yield sse_event("answer_reset", {"request_id": request_id})
+                        generation.citations = model_result.get("citations", [])
+                        if generation.citations:
+                            yield sse_event("citations", {"request_id": request_id, "citations": generation.citations})
                         self.reply = text
                         final_received = True
                         if remaining:
@@ -167,11 +183,12 @@ class ConversationStreamResponse(StreamingResponse):
                         artifact = message.artifact if isinstance(message.artifact, dict) else {}
                         error = artifact.get("error")
                         if message.status == "error":
-                            error = "搜索工具调用失败，请检查查询参数后重试"
-                        yield sse_event("tool_end", {"request_id": request_id,
+                            error = "工具调用失败，请检查查询参数后重试"
+                        yield sse_event("retrieval_end" if message.name == "knowledge_search" else "tool_end", {"request_id": request_id,
                             "call_id": message.tool_call_id, "tool": message.name,
                             "query": calls.get(message.tool_call_id, ""),
                             "status": "error" if error else "completed", "error": error,
+                            "citations": artifact.get("citations", []),
                             "sources": [{"title": item["title"], "url": item["url"]}
                                         for item in artifact.get("sources", [])]})
         if not final_received:
@@ -269,7 +286,7 @@ class ConversationStreamResponse(StreamingResponse):
         except HTTPException:
             self.failed = True
             logger.warning("流式回答请求已过期 会话=%s 消息请求=%s", self.generation.conversation_id, request_id)
-            yield sse_event("error", {"request_id": request_id, "code": "request_expired", "message": "本次请求已过期，请重新打开会话"})
+            yield sse_event("error", {"request_id": request_id, "code": "request_expired", "message": "请求已过期或引用的资料已删除，请重新提问"})
         except Exception:
             self.failed = True
             logger.exception("流式生成异常 会话=%s 消息请求=%s", self.generation.conversation_id, request_id)

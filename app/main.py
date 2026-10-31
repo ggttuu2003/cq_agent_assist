@@ -1,6 +1,7 @@
 """FastAPI 应用入口。"""
 
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
+import asyncio
 import logging
 
 import httpx
@@ -8,6 +9,9 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from sqlalchemy.exc import SQLAlchemyError
 
+from app.api.knowledge import router as knowledge_router
+from app.services.knowledge import KnowledgeService
+from app.knowledge.worker import KnowledgeWorker
 from app.api.profile import router as profile_router
 from app.api.chat import router as chat_router
 from app.api.conversations import router as conversations_router
@@ -42,8 +46,17 @@ async def lifespan(app: FastAPI):
         logger.info("MySQL 初始化完成")
         async with httpx.AsyncClient(timeout=settings.llm_timeout) as client:
             app.state.http_client = client
-            logger.info("应用就绪")
-            yield
+            app.state.knowledge = KnowledgeService(settings, app.state.db_sessions, client)
+            # 队列保存在 MySQL；应用重启可以恢复，多个进程用租约避免重复执行。
+            worker = asyncio.create_task(KnowledgeWorker(app.state.knowledge).run())
+            logger.info("应用就绪，知识资料处理器已启动")
+            try:
+                yield
+            finally:
+                worker.cancel()
+                with suppress(asyncio.CancelledError):
+                    await worker
+                await app.state.knowledge.close()
     finally:
         await engine.dispose()
         logger.info("应用关闭，数据库和网络连接已释放")
@@ -81,6 +94,7 @@ app.include_router(conversations_router)
 app.include_router(chat_router)
 app.include_router(health_router)
 app.include_router(attachments_router)
+app.include_router(knowledge_router)
 
 # 使用 ASGI 中间件包住完整响应，避免把“响应头已返回”当作流式生成完成。
 app.add_middleware(RequestLoggingMiddleware)
