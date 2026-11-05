@@ -1,6 +1,10 @@
 """会话开启知识库时固定执行的检索节点，不依赖模型选择工具。"""
 
 import logging
+import re
+from time import perf_counter
+
+from app.services.traces import trace_context
 
 from langgraph.config import get_config
 
@@ -24,15 +28,51 @@ def message_text(message) -> str:
                      if isinstance(block, dict) and block.get("type") == "text")
 
 
+def needs_question_context(text: str) -> bool:
+    """只识别明确指代或省略主题的中文追问，不用字数猜测语义。
+
+    这是保守规则，不是完整的语义理解；不明确的问题直接检索自身。
+    完整的新问题如“如何缓解过拟合”不会匹配省略主题的表达。
+    """
+    question = text.strip().rstrip("？?！!。.").strip()
+    if re.match(r"^(?:那|那么)?(?:它们?|上述|前面|刚才|上面)", question):
+        return True
+    if re.match(r"^(?:那|那么)?(?:这(?:个|些|种)?|那(?:个|些|种))(?:的|有什么|有何|怎么|如何|是指|是什么意思|呢$)", question):
+        return True
+    if re.fullmatch(r"(?:那|那么)?第[一二三四五六七八九十\d]+(?:种|个|条|步)(?:方法|方案|方式|步骤)?(?:呢|怎么样|怎么用|怎么实现)?", question):
+        return True
+    # 必须整句匹配：问句带了具体主题时，不再补充历史话题。
+    return bool(re.fullmatch(
+        r"(?:那|那么|然后)?(?:该|应该|可以|要)?(?:怎么|如何|怎样)"
+        r"(?:缓解|解决|优化|使用|实现|处理|配置|选择|避免|改进|验证|操作)"
+        r"(?:一下)?(?:呢|啊|呀|吗|比较好|才好)?", question))
+
+
 def prepare_retrieval(state) -> dict:
-    """生成有上限的查询词；先完成此节点，客户端就能收到检索开始事件。"""
+    """默认按当前问题检索；明确追问只补用户问题，模型回答不作为检索词。"""
     messages = state["messages"]
     current = message_text(messages[-1]).strip()
     query = current[:400]
-    # 短追问补充最近一轮问答，当前问题放在最后；完整长问题直接检索自身。
-    if len(current) < 60 and len(messages) > 1:
-        context = "\n".join(message_text(item)[:130] for item in messages[-3:-1])
-        query = f"最近对话：{context}\n当前问题：{current}"[:400]
+    if not needs_question_context(current) or len(current) >= 400:
+        return {"retrieval_query": query}
+
+    context = []
+    for message in reversed(messages[:-1]):
+        # 工具结果、系统消息、模型回复可能冗长或带有错误，不加入查询上下文。
+        if message.type != "human":
+            continue
+        previous = message_text(message).strip()
+        if not previous:
+            continue
+        context.insert(0, previous[:120])
+        # 连续追问最多回溯三条，找到最近的独立问题后不再混入更早的话题。
+        if len(context) >= 3 or not needs_question_context(previous):
+            break
+    if context:
+        prefix, suffix = "相关用户问题：", f"\n当前问题：{current}"
+        budget = min(260, 400 - len(prefix) - len(suffix))
+        if budget > 0:
+            query = prefix + "\n".join(context)[:budget] + suffix
     return {"retrieval_query": query}
 
 
@@ -42,6 +82,10 @@ async def retrieve_knowledge(state) -> dict:
     service, user_id = config.get("knowledge_service"), config.get("knowledge_user_id")
     query = state["retrieval_query"]
     logger.info("知识检索开始 用户=%s 查询字符数=%s", user_id, len(query))
+    trace = trace_context.get()
+    if trace is not None:
+        await trace.start_retrieval(query)
+    started = perf_counter()
     try:
         if service is None or user_id is None:
             raise KnowledgeError("知识库服务尚未准备好")
@@ -52,4 +96,6 @@ async def retrieve_knowledge(state) -> dict:
         result = {"citations": [], "error": str(exc), "message": "知识库检索失败，本轮未获得资料"}
         logger.warning("知识检索失败 用户=%s 原因=%s", user_id, exc)
     logger.info("固定知识检索结束 命中数=%s 失败=%s", len(result["citations"]), bool(result["error"]))
+    if trace is not None:
+        await trace.retrieval(query, result, round((perf_counter() - started) * 1000))
     return {"retrieval": result, "citations": result["citations"]}

@@ -56,7 +56,7 @@ export class ApiError extends Error {
 }
 
 /** 所有请求由同源 /api 代理转发，不在前端保存模型密钥。 */
-async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
+export async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   const response = await fetch(`/api${path}`, {
     ...options, credentials: 'same-origin', cache: 'no-store',
     headers: { 'Content-Type': 'application/json', ...options.headers },

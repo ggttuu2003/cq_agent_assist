@@ -221,7 +221,7 @@ class TestKnowledgeText(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(result['citations'], [])
 
     async def test_followup_query_uses_text_context_without_image_data(self):
-        """短追问补充最近上下文，图片数据不会泄露到向量服务。"""
+        """明确追问补充用户问题；图片和模型回答不进入检索词。"""
         from langchain_core.messages import HumanMessage, AIMessage
         result = prepare_retrieval({'messages': [HumanMessage(content='过拟合和欠拟合有什么区别'),
             AIMessage(content='过拟合可以使用正则化缓解'), HumanMessage(content=[
@@ -230,7 +230,58 @@ class TestKnowledgeText(unittest.IsolatedAsyncioTestCase):
         self.assertIn('过拟合', result['retrieval_query'])
         self.assertIn('第二种方法呢', result['retrieval_query'])
         self.assertNotIn('base64', result['retrieval_query'])
+        self.assertNotIn('正则化', result['retrieval_query'])
         self.assertLessEqual(len(result['retrieval_query']), 400)
+
+    async def test_independent_questions_do_not_inherit_previous_topic(self):
+        """问候、短问题和带完整主题的问题只检索自身，不受长度影响。"""
+        from langchain_core.messages import HumanMessage, AIMessage
+        history = [HumanMessage(content='什么是过拟合'), AIMessage(content='过拟合可以正则化')]
+        for question in ['你好', '谢谢', 'OK', '什么是梯度下降？', '如何缓解过拟合？',
+                         '那如何缓解过拟合？', '那么什么是梯度下降？', '推荐 Python 课程',
+                         '这是一个新问题：什么是梯度下降？']:
+            with self.subTest(question=question):
+                result = prepare_retrieval({'messages': [*history, HumanMessage(content=question)]})
+                self.assertEqual(result['retrieval_query'], question)
+
+    async def test_explicit_followups_use_user_questions_only(self):
+        """省略主题或明确指代的追问可用上文定位，但不拼接工具或模型结果。"""
+        from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, ToolMessage
+        history = [HumanMessage(content='什么是过拟合'), AIMessage(content='不应进入检索的模型回答'),
+                   ToolMessage(content='不应进入检索的网页', tool_call_id='search'),
+                   SystemMessage(content='不应进入检索的系统消息')]
+        for question in ['那怎么缓解？', '如何缓解？', '它有什么缺点？', '这个有什么用？',
+                         '那它怎么实现？', '第二种方法呢？', '上述方法有什么区别？']:
+            with self.subTest(question=question):
+                query = prepare_retrieval({'messages': [*history, HumanMessage(content=question)]})['retrieval_query']
+                self.assertIn('什么是过拟合', query)
+                self.assertTrue(query.endswith('当前问题：' + question))
+                self.assertNotIn('不应进入检索', query)
+
+    async def test_followups_stop_at_new_topic_and_bound_context(self):
+        """连续追问保留当前问题，最近独立问题之前的旧话题不应带入。"""
+        from langchain_core.messages import HumanMessage, AIMessage
+        questions = ['什么是过拟合', '什么是梯度下降', '它怎么实现？', '那怎么优化？', '它有什么缺点？']
+        messages = []
+        for question in questions:
+            messages.extend([HumanMessage(content=question), AIMessage(content='冗长模型回答' * 100)])
+        result = prepare_retrieval({'messages': messages[:-1]})['retrieval_query']
+        self.assertIn('什么是梯度下降', result)
+        self.assertNotIn('过拟合', result)
+        self.assertNotIn('冗长模型回答', result)
+        self.assertTrue(result.endswith('当前问题：它有什么缺点？'))
+        self.assertLessEqual(len(result), 400)
+
+        long_question = '它有什么缺点？' + '请详细解释每一种情况。' * 40
+        self.assertEqual(prepare_retrieval({'messages': [HumanMessage(content='旧话题'),
+            HumanMessage(content=long_question)]})['retrieval_query'], long_question[:400])
+        near_limit = '它的' + '问题' * 190
+        query = prepare_retrieval({'messages': [HumanMessage(content='主题' * 300),
+            HumanMessage(content=near_limit)]})['retrieval_query']
+        self.assertLessEqual(len(query), 400)
+        self.assertTrue(query.endswith(near_limit))
+        self.assertEqual(prepare_retrieval({'messages': [HumanMessage(content='那怎么缓解？')]})[
+            'retrieval_query'], '那怎么缓解？')
 
 
 @unittest.skipUnless(os.getenv('CQ_TEST_MYSQL') == '1', '设置 CQ_TEST_MYSQL=1 运行临时 MySQL 知识库测试')

@@ -3,6 +3,7 @@
 from datetime import datetime
 import asyncio
 import json
+import sys
 import logging
 from time import perf_counter
 from zoneinfo import ZoneInfo
@@ -16,6 +17,7 @@ from langgraph.prebuilt import ToolNode, tools_condition
 from openai import APIConnectionError, APIResponseValidationError, APIStatusError, APITimeoutError
 
 from app.agent.retrieval import entry_node, prepare_retrieval, retrieve_knowledge
+from app.services.traces import ModelCall, call_context, trace_context
 from app.llm.errors import ModelError
 from app.llm.factory import image_input_support
 
@@ -116,8 +118,15 @@ class ModelNode:
             raise ModelError(f"模型 {self.model_name} 仅支持文字，请使用视觉模型处理图片")
         started = perf_counter()
         outcome = "失败"
+        provider_error = None
         logger.info("模型调用开始 模型=%s 消息数=%s 图片数=%s 已用工具轮数=%s", self.model_name,
                     len(state["messages"]), image_count, tool_rounds)
+        # 上下文属于本次问答；共享的模型客户端只在发送时读取当前调用，不保存会话状态。
+        trace = trace_context.get()
+        call = ModelCall(trace, self.model_name) if trace is not None else None
+        if call is not None:
+            await call.start()
+        token = call_context.set(call)
         try:
             # ainvoke 是异步调用方法；await 等待模型回答，同时允许处理其他请求。
             retrieval = state.get("retrieval")
@@ -127,20 +136,24 @@ class ModelNode:
                                             json.dumps(retrieval, ensure_ascii=False)))
             response = await model.ainvoke([*prompt, *state["messages"]])
             outcome = "返回"
-        except APITimeoutError:
+        except APITimeoutError as exc:
+            provider_error = exc
             logger.warning("模型调用超时 模型=%s", self.model_name)
             raise ModelError("模型响应超时，请稍后重试") from None
         except APIStatusError as exc:
+            provider_error = exc
             logger.warning("模型服务请求失败 模型=%s status=%s", self.model_name, exc.status_code)
             if exc.status_code == 400 and image_count:
                 raise ModelError("图片请求被模型服务拒绝，请确认本会话模型支持图片，并检查图片大小；可在输入框旁切换到视觉模型") from None
             raise ModelError(
                 f"模型服务返回 HTTP {exc.status_code}，请检查模型配置或额度"
             ) from None
-        except APIConnectionError:
+        except APIConnectionError as exc:
+            provider_error = exc
             logger.warning("模型服务连接失败 模型=%s", self.model_name)
             raise ModelError("无法连接模型服务，请检查网络和服务地址") from None
-        except (APIResponseValidationError, ValueError, KeyError, IndexError, TypeError):
+        except (APIResponseValidationError, ValueError, KeyError, IndexError, TypeError) as exc:
+            provider_error = exc
             logger.warning("模型响应格式异常 模型=%s", self.model_name, exc_info=True)
             raise ModelError("模型返回的数据格式不符合预期") from None
         except asyncio.CancelledError:
@@ -150,6 +163,12 @@ class ModelNode:
             logger.error("模型调用发生未预期异常 模型=%s", self.model_name, exc_info=True)
             raise
         finally:
+            error = provider_error or sys.exc_info()[1]
+            try:
+                if call is not None:
+                    await call.finish("completed" if outcome == "返回" else "cancelled" if outcome == "取消" else "failed", error)
+            finally:
+                call_context.reset(token)
             logger.info("模型调用结束 模型=%s 结果=%s 耗时=%.0fms", self.model_name,
                         outcome, (perf_counter() - started) * 1000)
 

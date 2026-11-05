@@ -138,7 +138,7 @@ async def get_user_conversation(db: AsyncSession, user_id: int, conversation_id:
 
 
 def model_history(messages: list[Message], image_count=0, image_size=0,
-                  include_images=True) -> list[tuple[str, str | list[dict]]]:
+                  include_images=True, image_sources: dict | None = None) -> list[tuple[str, str | list[dict]]]:
     """按整轮保留最近历史，文字和图片都设上限；生产调用放在工作线程读文件。"""
     rounds = []
     total = 0
@@ -152,7 +152,7 @@ def model_history(messages: list[Message], image_count=0, image_size=0,
                 or image_size + pair_image_size > MAX_IMAGE_TOTAL_SIZE):
             break
         rounds.insert(0, [(message.role, message_content(message.content,
-                          [attachment_info(item) for item in message.attachments] if include_images else [])) for message in pair])
+                          [attachment_info(item) for item in message.attachments] if include_images else [], image_sources)) for message in pair])
         total += size
         image_count += len(images)
         image_size += pair_image_size
@@ -187,6 +187,7 @@ class Generation:
     saved: ConversationTurnInfo | None = None
     citations: list[dict] = field(default_factory=list)
     knowledge_enabled: bool = False
+    trace_images: dict = field(default_factory=dict)
 
 
 def turn_info(conversation: Conversation, request_id: str, messages: list[Message]) -> ConversationTurnInfo:
@@ -250,11 +251,11 @@ async def prepare_generation(db: AsyncSession, user_id: int, conversation_id: st
     try:
         # 先释放行锁和连接，再读图和编码，避免持锁等待文件处理。
         generation.current_content = await anyio.to_thread.run_sync(
-            message_content, body.message, [attachment_info(item) for item in attachments],
+            message_content, body.message, [attachment_info(item) for item in attachments], generation.trace_images,
         )
         generation.history = await anyio.to_thread.run_sync(
             model_history, history_rows, len(attachments), sum(item.size for item in attachments),
-            supports_images is not False,
+            supports_images is not False, generation.trace_images,
         )
     except BaseException:
         # 领取占用后，即使图片丢失或客户端取消，也必须释放本次占用。

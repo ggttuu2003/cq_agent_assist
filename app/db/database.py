@@ -6,7 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 
 from app.core.settings import Settings
 from app.db.models import Base
-from app.db import knowledge  # 注册知识资料表，交给同一份 metadata 创建。
+from app.db import knowledge, traces  # 注册知识资料和调用记录表，交给同一份 metadata 创建。
 
 
 def create_database(settings: Settings):
@@ -24,6 +24,18 @@ async def initialize_database(engine, default_model: str = "") -> None:
     """创建缺失的表，并为旧会话补上模型字段。"""
     async with engine.begin() as connection:
         await connection.run_sync(Base.metadata.create_all)
+        # 调用记录保留微秒，避免同一秒内失败重试的执行顺序不确定。
+        for table_name in ("cq_ai_trace", "cq_ai_call"):
+            trace_columns = await connection.run_sync(
+                lambda sync_connection, name=table_name: inspect(sync_connection).get_columns(name)
+            )
+            created = next(column for column in trace_columns if column["name"] == "created_at")
+            if getattr(created["type"], "fsp", 0) != 6:
+                changes = ["MODIFY created_at DATETIME(6) NOT NULL COMMENT '开始时间UTC'",
+                           "MODIFY finished_at DATETIME(6) NULL COMMENT '结束时间UTC'"]
+                if table_name == "cq_ai_trace":
+                    changes.append("MODIFY expires_at DATETIME(6) NOT NULL COMMENT '预计最晚结束时间UTC'")
+                await connection.execute(text(f"ALTER TABLE {table_name} " + ", ".join(changes)))
         message_columns = await connection.run_sync(
             lambda sync_connection: [column["name"] for column in inspect(sync_connection).get_columns("cq_message")]
         )

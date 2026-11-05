@@ -9,6 +9,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from sqlalchemy.exc import SQLAlchemyError
 
+from app.api.traces import router as traces_router
 from app.api.knowledge import router as knowledge_router
 from app.services.knowledge import KnowledgeService
 from app.knowledge.worker import KnowledgeWorker
@@ -95,6 +96,7 @@ app.include_router(chat_router)
 app.include_router(health_router)
 app.include_router(attachments_router)
 app.include_router(knowledge_router)
+app.include_router(traces_router)
 
 # 使用 ASGI 中间件包住完整响应，避免把“响应头已返回”当作流式生成完成。
 app.add_middleware(RequestLoggingMiddleware)

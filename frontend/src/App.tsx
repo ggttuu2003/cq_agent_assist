@@ -20,6 +20,7 @@ import {
   Cpu,
   Globe,
   ImagePlus,
+  ListTree,
   Pencil,
   MessageSquare,
   UserRound,
@@ -39,6 +40,8 @@ import { attachmentUrl, createConversation, getConversation, getModels, listConv
 // Markdown 和代码高亮体积较大，首次出现回答时再加载，欢迎页可以更快显示。
 const Markdown = lazy(() => import('./Markdown'));
 const Knowledge = lazy(() => import('./Knowledge'));
+const TraceDrawer = lazy(() => import('./TraceDrawer'));
+import type { TraceTarget } from './trace-api';
 import type { KnowledgeTarget } from './knowledge-api';
 
 const SIDEBAR_WIDTH_KEY = 'cq-assist.sidebar-width';
@@ -111,6 +114,7 @@ export default function ChatWorkspace({ user, profileLoading, profileError, conn
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [activeId, setActiveId] = useState<string | null>(loadActiveConversation);
   const [section, setSection] = useState<'chat' | 'knowledge'>(() => new URL(location.href).searchParams.get('view') === 'knowledge' ? 'knowledge' : 'chat');
+  const [traceTarget, setTraceTarget] = useState<TraceTarget | null>(null);
   const [knowledgeTarget, setKnowledgeTarget] = useState<KnowledgeTarget | null>(null);
   const [historyLoading, setHistoryLoading] = useState(true);
   const [historyError, setHistoryError] = useState('');
@@ -150,6 +154,7 @@ export default function ChatWorkspace({ user, profileLoading, profileError, conn
   const scrollRef = useRef<HTMLDivElement>(null);
   const searchRef = useRef<HTMLInputElement>(null);
   const searchTriggerRef = useRef<HTMLButtonElement>(null);
+  const traceTriggerRef = useRef<HTMLButtonElement | null>(null);
   const searchDialogRef = useRef<HTMLDialogElement>(null);
   const requestRef = useRef<AbortController | null>(null);
   const shouldFollowRef = useRef(true);
@@ -165,6 +170,7 @@ export default function ChatWorkspace({ user, profileLoading, profileError, conn
   const visibleSidebarWidth = Math.min(maxSidebarWidth, sidebarWidth);
   const active = conversations.find((item) => item.id === activeId);
   const messages = active?.messages ?? [];
+  useEffect(() => { setTraceTarget(null); }, [activeId, section]);
   const restoringConversation = !!activeId && !active;
   const isWelcome = messages.length === 0 && !restoringConversation;
   // 已有会话使用服务端保存的选择，新对话先在草稿中选择，发送时一起创建。
@@ -600,8 +606,8 @@ export default function ChatWorkspace({ user, profileLoading, profileError, conn
       if (controller.signal.aborted) return;
       const answerId = createId();
       const additions: Message[] = [
-        { id: createId(), role: 'user', content: question, attachments },
-        { id: answerId, role: 'assistant', content: '', status: 'pending' },
+        { id: createId(), role: 'user', content: question, attachments, requestId: answerId },
+        { id: answerId, role: 'assistant', content: '', status: 'pending', requestId: answerId },
       ];
       const updated = { ...conversation,
         updatedAt: Date.now(), messages: [...conversation.messages, ...additions] };
@@ -1131,6 +1137,10 @@ export default function ChatWorkspace({ user, profileLoading, profileError, conn
                       <div className="assistant-identity">
                         <BrandMark />
                         <span>CQ Assist</span>
+                        {message.requestId && active && <button className="trace-open-button" title="查看本次提问的检索与模型请求"
+                          onClick={(event) => { traceTriggerRef.current = event.currentTarget; setTraceTarget({ conversationId: active.id, requestId: message.requestId! }); }}>
+                          <ListTree size={13} />查看调用
+                        </button>}
                       </div>
                       {message.toolCalls?.map((call) => (
                         <div key={call.id} className={`tool-progress tool-${call.status}`} role="status">
@@ -1202,6 +1212,12 @@ export default function ChatWorkspace({ user, profileLoading, profileError, conn
       {section === 'knowledge' && !user && <main className="main-panel knowledge-panel"><div className="knowledge-empty">{profileError || '正在连接服务…'}
         <button className="text-button" onClick={onRetryProfile}>重新连接</button></div></main>}
 
+      {traceTarget && <Suspense fallback={null}><TraceDrawer key={`${traceTarget.conversationId}:${traceTarget.requestId}`}
+        target={traceTarget} onClose={() => {
+          setTraceTarget(null);
+          // 抽屉卸载后再恢复焦点，此时聊天区已解除 dialog 的不可交互状态。
+          window.requestAnimationFrame(() => traceTriggerRef.current?.focus());
+        }} /></Suspense>}
       <dialog
         ref={searchDialogRef}
         className="search-dialog"

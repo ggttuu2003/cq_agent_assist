@@ -15,6 +15,7 @@ from starlette.types import Receive, Scope, Send
 
 from app.llm.errors import ModelError
 from app.services.conversations import Generation, release_generation, save_generation
+from app.services.traces import TraceRun
 
 logger = logging.getLogger(__name__)
 
@@ -100,7 +101,11 @@ class ConversationStreamResponse(StreamingResponse):
         """发送结束或浏览器断开后，让另一个监听任务一同退出。"""
         try:
             # 父类负责发送响应头，并通过 async for 读取 body_iterator，把每一段写给浏览器。
-            await self.stream_response(send)
+            async with TraceRun(self.sessions, self.generation) as trace:
+                try:
+                    await self.stream_response(send)
+                finally:
+                    trace.outcome = "completed" if self.completed else "failed" if self.failed else "cancelled"
         except OSError:
             # 有些 ASGI 服务通过发送异常通知断开，同样进入统一清理。
             pass

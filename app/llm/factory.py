@@ -7,6 +7,7 @@ from langchain_openai import ChatOpenAI
 
 from app.core.settings import Settings
 from app.llm.errors import ModelConfigurationError
+from app.services.traces import capture_model_request
 
 
 def available_models(settings: Settings) -> list[str]:
@@ -51,6 +52,10 @@ def create_chat_model(settings: Settings, client: httpx.AsyncClient) -> ChatOpen
     address = urlsplit(base_url)
     if address.scheme not in {"http", "https"} or not address.hostname:
         raise ModelConfigurationError("LLM_BASE_URL 必须是完整的 HTTP 或 HTTPS 地址")
+
+    # 在共享客户端登记一次钩子；测试客户端和后续更换的兼容服务也能记录真实请求。
+    if capture_model_request not in client.event_hooks["request"]:
+        client.event_hooks["request"].append(capture_model_request)
 
     return ChatOpenAI(
         model=model_name,

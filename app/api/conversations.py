@@ -26,6 +26,7 @@ from app.services.conversations import (
     switch_conversation_knowledge,
 )
 from app.services.streaming import ConversationStreamResponse
+from app.services.traces import TraceRun
 
 router = APIRouter(prefix="/conversations", tags=["会话"])
 
@@ -93,11 +94,12 @@ async def delete_conversation(conversation_id: UUID, user: CurrentUser, db: Db):
 
 
 @router.post("/{conversation_id}/messages", response_model=ConversationInfo)
-async def send_message(generation: PreparedGeneration, db: Db,
+async def send_message(request: Request, generation: PreparedGeneration, db: Db,
                        agent: Annotated[CompiledStateGraph, Depends(get_conversation_agent)]):
     """提交消息，业务层负责读取上下文、调用图并保存结果。"""
     try:
-        return await answer_message(db, generation, agent)
+        async with TraceRun(request.app.state.db_sessions, generation):
+            return await answer_message(db, generation, agent)
     except ModelError as exc:
         raise HTTPException(502, str(exc)) from None
     except TimeoutError:

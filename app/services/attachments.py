@@ -1,6 +1,7 @@
 """图片校验、附件存取和模型内容块转换。"""
 
 import base64
+import hashlib
 import io
 import logging
 import warnings
@@ -112,7 +113,7 @@ async def read_image(db: AsyncSession, user_id: int, attachment_id: str) -> tupl
     return attachment_info(attachment), path
 
 
-def message_content(text: str, attachments: list[AttachmentInfo]) -> str | list[dict]:
+def message_content(text: str, attachments: list[AttachmentInfo], image_sources: dict | None = None) -> str | list[dict]:
     """纯文字保留字符串；图片在工作线程读取后变成模型能直接接收的内容块。"""
     if not attachments:
         return text
@@ -122,5 +123,9 @@ def message_content(text: str, attachments: list[AttachmentInfo]) -> str | list[
             encoded = base64.b64encode((ATTACHMENT_DIR / item.id).read_bytes()).decode("ascii")
         except OSError:
             raise HTTPException(409, "图片文件已不可用，请重新上传后发送") from None
-        blocks.append({"type": "image_url", "image_url": {"url": f"data:{item.media_type};base64,{encoded}"}})
+        url = f"data:{item.media_type};base64,{encoded}"
+        if image_sources is not None:
+            # 在已有的读图过程中建立映射，调用记录无需再次扫描或复制图片。
+            image_sources[hashlib.sha256(url.encode()).hexdigest()] = item.model_dump()
+        blocks.append({"type": "image_url", "image_url": {"url": url}})
     return blocks
